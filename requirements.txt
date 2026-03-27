@@ -1,8 +1,12 @@
 streamlit
+streamlit
 pandas
 numpy<2.0
 dowhy
 scikit-learn
-graphviz
 openai
+
+# Graph stack (pin versions)
+graphviz==0.20
+pydot==1.4.2
 networkx==2.8
