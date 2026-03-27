@@ -5,3 +5,4 @@ dowhy
 scikit-learn
 graphviz
 openai
+networkx==2.8
