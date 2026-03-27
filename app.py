@@ -570,17 +570,18 @@ if st.sidebar.button("Estimate Effect"):
         # -----------------------------
         st.subheader("🔍 Refutation Test")
 
+        refutation = None  # ✅ ALWAYS define first
+
         try:
             refutation = model.refute_estimate(
                 identified_estimand,
                 estimate,
-                method_name="placebo_treatment_refuter",
-                method_params={"num_simulations": 5}
+                method_name="placebo_treatment_refuter"
             )
 
             st.write(refutation)
 
-        except Exception as e:
+        except Exception:
             st.warning(
                 "Refutation test could not be completed. "
                 "This can happen with small samples or random assignment issues."
@@ -611,11 +612,14 @@ if st.sidebar.button("Estimate Effect"):
             signals.append("weak_agreement")
 
         # 3. Refutation signal (simple heuristic)
-        ref_text = str(refutation)
-        if "significant" in ref_text.lower():
-            signals.append("refutation_pass")
+        if refutation is not None:
+            ref_text = str(refutation)
+            if "significant" in ref_text.lower():
+                signals.append("refutation_pass")
+            else:
+                signals.append("refutation_unclear")
         else:
-            signals.append("refutation_unclear")
+            signals.append("refutation_failed")
 
 
         # -----------------------------
