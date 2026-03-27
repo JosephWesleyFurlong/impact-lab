@@ -75,6 +75,9 @@ import json
 
 client = OpenAI()
 
+
+
+
 def ai_suggest_variables(question, columns):
     prompt = f"""
 You are helping build a causal inference model.
@@ -202,6 +205,71 @@ Keep it simple and practical for a non-technical audience.
 
     return response.choices[0].message.content
 
+# -----------------------------
+# AI Data Understanding (NEW)
+# -----------------------------
+def describe_dataset(df):
+    summary = {
+        "columns": list(df.columns),
+        "num_rows": len(df),
+        "dtypes": df.dtypes.astype(str).to_dict(),
+        "missing": df.isnull().sum().to_dict()
+    }
+
+    prompt = f"""
+You are helping a program evaluator understand their dataset.
+
+Here is the dataset summary:
+{summary}
+
+Explain:
+1. What this dataset likely represents
+2. Which variables could be treatments, outcomes, or confounders
+3. Any data quality issues
+
+Keep it simple and practical.
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.choices[0].message.content
+
+
+def check_data_readiness(df, treatment, outcome, confounders):
+    issues = []
+
+    if df[treatment].nunique() < 2:
+        issues.append("Treatment has no variation")
+
+    if df[outcome].nunique() < 2:
+        issues.append("Outcome has no variation")
+
+    missing = df[[treatment, outcome] + confounders].isnull().sum().sum()
+    if missing > 0:
+        issues.append("Missing values detected")
+
+    return issues
+
+
+def suggest_fixes(df, issues):
+    prompt = f"""
+A dataset has the following issues:
+{issues}
+
+Suggest simple ways to fix them using pandas or Excel.
+
+Keep suggestions beginner-friendly.
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.choices[0].message.content
 
 # -----------------------------
 # Data Section
@@ -225,6 +293,15 @@ else:
 
 st.subheader("Preview Data")
 st.dataframe(df.head())
+
+# -----------------------------
+# AI Data Understanding (NEW)
+# -----------------------------
+with st.expander("🧠 Understand Your Data", expanded=False):
+
+    if st.button("Explain My Dataset"):
+        explanation = describe_dataset(df)
+        st.write(explanation)
 
 # -----------------------------
 # Optional AI Assistant
@@ -328,6 +405,23 @@ confounders = st.multiselect(
 st.session_state.treatment = treatment
 st.session_state.outcome = outcome
 st.session_state.confounders = confounders
+
+# -----------------------------
+# Data Readiness Check (NEW)
+# -----------------------------
+st.subheader("🧪 Data Readiness Check")
+
+issues = check_data_readiness(df, treatment, outcome, confounders)
+
+if not issues:
+    st.success("✅ Data looks ready for causal analysis")
+else:
+    for issue in issues:
+        st.warning(issue)
+
+    if st.button("🛠 Suggest Fixes"):
+        fixes = suggest_fixes(df, issues)
+        st.write(fixes)
 
 # -----------------------------
 # Build DAG
