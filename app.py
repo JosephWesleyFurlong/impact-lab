@@ -570,13 +570,21 @@ if st.sidebar.button("Estimate Effect"):
         # -----------------------------
         st.subheader("🔍 Refutation Test")
 
-        refutation = model.refute_estimate(
-            identified_estimand,
-            estimate,
-            method_name="placebo_treatment_refuter"
-        )
+        try:
+            refutation = model.refute_estimate(
+                identified_estimand,
+                estimate,
+                method_name="placebo_treatment_refuter",
+                method_params={"num_simulations": 5}
+            )
 
-        st.write(refutation)
+            st.write(refutation)
+
+        except Exception as e:
+            st.warning(
+                "Refutation test could not be completed. "
+                "This can happen with small samples or random assignment issues."
+            )
 
                 # -----------------------------
         # Confidence Summary (NEW)
