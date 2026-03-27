@@ -6,7 +6,7 @@ import os
 from graphviz import Digraph
 
 
-st.write("API Key Loaded:", bool(os.getenv("OPENAI_API_KEY")))
+#st.write("API Key Loaded:", bool(os.getenv("OPENAI_API_KEY")))
 st.set_page_config(page_title="Causal Inference MVP", layout="wide")
 
 st.title("🧠 Causal Inference MVP for Program Evaluation")
@@ -273,30 +273,42 @@ Keep suggestions beginner-friendly.
 
 
 # -----------------------------
-# Auto Clean Pipeline (NEW)
+# Auto Clean Pipeline (UPDATED)
 # -----------------------------
 def auto_clean_data(df, treatment, outcome, confounders):
     df_clean = df.copy()
 
+    # -----------------------------
     # Drop missing key variables
+    # -----------------------------
     df_clean = df_clean.dropna(subset=[treatment, outcome])
 
+    # -----------------------------
     # Convert numeric columns where possible
+    # -----------------------------
     for col in [treatment, outcome] + confounders:
         try:
             df_clean[col] = pd.to_numeric(df_clean[col])
         except:
             pass
 
-    # Clean column names
-    df_clean.columns = (
-        df_clean.columns
-        .str.strip()
-        .str.lower()
-        .str.replace(" ", "_")
-    )
+    # -----------------------------
+    # Create safe rename map
+    # -----------------------------
+    rename_map = {
+        col: col.strip().lower().replace(" ", "_")
+        for col in df_clean.columns
+    }
 
-    return df_clean
+    # -----------------------------
+    # Apply renaming
+    # -----------------------------
+    df_clean = df_clean.rename(columns=rename_map)
+
+    # -----------------------------
+    # Return BOTH cleaned data and mapping
+    # -----------------------------
+    return df_clean, rename_map
 
 
 # -----------------------------
@@ -325,7 +337,6 @@ else:
 if "df_clean" in st.session_state:
     df = st.session_state.df_clean
 
-if "df_clean" in st.session_state:
     col1, col2 = st.columns([3,1])
 
     with col1:
@@ -469,19 +480,85 @@ else:
         st.write(fixes)
 
 # -----------------------------
-# Auto Clean Button (NEW)
+# Recommended Analysis Approach (NEW)
+# -----------------------------
+st.subheader("🧭 Recommended Analysis Approach")
+
+if not issues:
+    recommendation = recommend_analysis_approach(df)
+
+    st.info(f"**Suggested Method:** {recommendation['method']}")
+
+    st.write(f"**Why:** {recommendation['reason']}")
+
+    st.caption(
+        "This recommendation is based on the structure of your dataset. "
+        "You can still choose alternative methods below."
+    )
+else:
+    st.info("Resolve data issues to receive a modeling recommendation.")
+
+    
+# -----------------------------
+# Method Recommendation (NEW)
+# -----------------------------
+def recommend_analysis_approach(df):
+    cols = df.columns.str.lower()
+
+    has_time = any("time" in c or "date" in c or "year" in c for c in cols)
+    has_post = any("post" in c for c in cols)
+    has_group = any("group" in c or "cohort" in c for c in cols)
+
+    if has_time and has_post:
+        return {
+            "method": "Difference-in-Differences",
+            "reason": "Your data includes time and a post/intervention indicator."
+        }
+    elif has_time:
+        return {
+            "method": "Interrupted Time Series",
+            "reason": "Your data includes a time variable but no clear comparison group."
+        }
+    else:
+        return {
+            "method": "Backdoor (PSM / Regression)",
+            "reason": "Your data appears cross-sectional with confounders."
+        }
+
+# -----------------------------
+# Auto Clean Button (UPDATED)
 # -----------------------------
 if st.button("✨ Clean My Data"):
 
-    df_clean = auto_clean_data(df, treatment, outcome, confounders)
+    # Run cleaning + get rename map
+    df_clean, rename_map = auto_clean_data(df, treatment, outcome, confounders)
 
+    # -----------------------------
+    # Update variable names safely
+    # -----------------------------
+    treatment = rename_map.get(treatment, treatment)
+    outcome = rename_map.get(outcome, outcome)
+    confounders = [rename_map.get(c, c) for c in confounders]
+
+    # -----------------------------
+    # Store cleaned data + updated variables
+    # -----------------------------
     st.session_state.df_clean = df_clean
+    st.session_state.treatment = treatment
+    st.session_state.outcome = outcome
+    st.session_state.confounders = confounders
 
-    st.success("Data cleaned and ready for analysis")
+    # -----------------------------
+    # Feedback to user
+    # -----------------------------
+    st.success("Data cleaned and variable names updated")
 
     st.subheader("Preview Cleaned Data")
     st.dataframe(df_clean.head())
 
+    # Optional: show rename mapping (great UX)
+    with st.expander("🔍 Column Name Changes", expanded=False):
+        st.json(rename_map)
 # -----------------------------
 # Build DAG
 # -----------------------------
@@ -683,12 +760,12 @@ if st.sidebar.button("Estimate Effect"):
         # Directional interpretation
         if psm_effect < 0:
             st.success(
-                f"📉 Mentoring may reduce the likelihood of disruption by about "
+                f"📉 {treatment} may reduce the likelihood of {outcome} by about "
                 f"{abs(psm_pct):.1f}%."
             )
         else:
             st.warning(
-                f"📈 Mentoring may increase the likelihood of disruption by about "
+                f"📈 {treatment} may increase the likelihood of {outcome} by about "
                 f"{abs(psm_pct):.1f}%."
             )
 
