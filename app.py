@@ -271,6 +271,34 @@ Keep suggestions beginner-friendly.
 
     return response.choices[0].message.content
 
+
+# -----------------------------
+# Auto Clean Pipeline (NEW)
+# -----------------------------
+def auto_clean_data(df, treatment, outcome, confounders):
+    df_clean = df.copy()
+
+    # Drop missing key variables
+    df_clean = df_clean.dropna(subset=[treatment, outcome])
+
+    # Convert numeric columns where possible
+    for col in [treatment, outcome] + confounders:
+        try:
+            df_clean[col] = pd.to_numeric(df_clean[col])
+        except:
+            pass
+
+    # Clean column names
+    df_clean.columns = (
+        df_clean.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+
+    return df_clean
+
+
 # -----------------------------
 # Data Section
 # -----------------------------
@@ -290,6 +318,23 @@ else:
         df = pd.read_csv(uploaded_file)
     else:
         st.stop()
+
+# -----------------------------
+# Use cleaned data if available
+# -----------------------------
+if "df_clean" in st.session_state:
+    df = st.session_state.df_clean
+
+if "df_clean" in st.session_state:
+    col1, col2 = st.columns([3,1])
+
+    with col1:
+        st.info("✨ Using cleaned dataset")
+
+    with col2:
+        if st.button("Undo"):
+            del st.session_state.df_clean
+            st.rerun()
 
 st.subheader("Preview Data")
 st.dataframe(df.head())
@@ -422,6 +467,20 @@ else:
     if st.button("🛠 Suggest Fixes"):
         fixes = suggest_fixes(df, issues)
         st.write(fixes)
+
+# -----------------------------
+# Auto Clean Button (NEW)
+# -----------------------------
+if st.button("✨ Clean My Data"):
+
+    df_clean = auto_clean_data(df, treatment, outcome, confounders)
+
+    st.session_state.df_clean = df_clean
+
+    st.success("Data cleaned and ready for analysis")
+
+    st.subheader("Preview Cleaned Data")
+    st.dataframe(df_clean.head())
 
 # -----------------------------
 # Build DAG
