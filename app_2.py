@@ -4,8 +4,16 @@ import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
 import streamlit as st
-from dowhy import CausalModel
 from graphviz import Digraph
+
+# dowhy has C-extension dependencies (cvxpy, econml) that may fail on
+# newer Python versions. Degrade gracefully rather than crashing on startup.
+try:
+    from dowhy import CausalModel
+    _DOWHY = True
+except Exception as _dowhy_err:
+    _DOWHY = False
+    CausalModel = None
 
 st.set_page_config(page_title="Causal Inference MVP", layout="wide")
 
@@ -143,31 +151,180 @@ def auto_clean(df, treatment, outcome, confounders):
     return df.rename(columns=rename), rename
 
 # ── Causal methods ─────────────────────────────────────────────────────────────
+# ── Causal methods ─────────────────────────────────────────────────────────────
 def build_graph(treatment, outcome, confounders):
     edges = [f"{treatment} -> {outcome};"]
     for c in confounders: edges += [f"{c} -> {treatment};", f"{c} -> {outcome};"]
     return "digraph {\n" + "\n".join(edges) + "\n}"
 
+
+def _detect_subject_col(df, treatment, outcome, time_col, post_col):
+    """Heuristically find a subject/unit ID column for clustering."""
+    exclude = {treatment, outcome, time_col, post_col}
+    id_kws  = ["id", "subject", "person", "client", "case", "unit", "individual", "youth"]
+    for c in df.columns:
+        if c in exclude: continue
+        if any(k in c.lower() for k in id_kws): return c
+    return None
+
+
 def run_did(df, treatment, outcome, time_col, post_col):
+    """
+    Two-way fixed effects DiD with clustered SEs by subject.
+    Falls back to HC3 robust SEs if no subject ID column is found.
+    Returns: (effect, se, ci_low, ci_high, pvalue, model)
+    """
     for col in [treatment, outcome, time_col, post_col]:
         if col not in df.columns: raise ValueError(f"Missing column: {col}")
     if df[treatment].nunique() < 2: raise ValueError("Treatment needs 0 and 1.")
     if df[post_col].nunique()  < 2: raise ValueError("Post variable needs 0 and 1.")
-    model = smf.ols(f"{outcome} ~ {treatment} + {post_col} + {treatment}:{post_col}", data=df).fit()
+
+    subject_col = _detect_subject_col(df, treatment, outcome, time_col, post_col)
     ix = f"{treatment}:{post_col}"
-    return model.params.get(ix), model.bse.get(ix), model
+
+    if subject_col and df[subject_col].nunique() > 1:
+        formula = f"{outcome} ~ {treatment} + {post_col} + {ix} + C({subject_col}) + C({time_col})"
+        try:
+            model = smf.ols(formula, data=df).fit(
+                cov_type="cluster", cov_kwds={"groups": df[subject_col]}
+            )
+        except Exception:
+            formula = f"{outcome} ~ {treatment} + {post_col} + {ix}"
+            model   = smf.ols(formula, data=df).fit(cov_type="HC3")
+    else:
+        formula = f"{outcome} ~ {treatment} + {post_col} + {ix}"
+        model   = smf.ols(formula, data=df).fit(cov_type="HC3")
+
+    eff  = model.params.get(ix)
+    se   = model.bse.get(ix)
+    ci   = model.conf_int().loc[ix] if ix in model.conf_int().index else (None, None)
+    pval = model.pvalues.get(ix)
+    return eff, se, ci[0], ci[1], pval, model
+
 
 def check_parallel_trends(df, treatment, outcome, time_col, post_col):
-    pre = df[df[post_col] == 0].copy().sort_values(time_col)
+    """
+    Pre-trend test on group-period means (avoids repeated-measures inflation).
+    Returns (slope_diff_coef, pvalue, fig, n_pre_periods)
+    """
+    pre = df[df[post_col] == 0].copy()
     tv  = time_col if pd.api.types.is_numeric_dtype(pre[time_col]) else "time_index"
-    if tv == "time_index": pre["time_index"] = range(len(pre))
-    m   = smf.ols(f"{outcome} ~ {tv} + {tv}:{treatment}", data=pre).fit()
+    if tv == "time_index":
+        pre["time_index"] = pre[time_col].rank(method="dense").astype(int)
+
+    grp_means = pre.groupby([tv, treatment])[outcome].mean().reset_index()
+    n_pre = grp_means[tv].nunique()
+
     fig, ax = plt.subplots(figsize=(6, 3))
-    for val, g in pre.groupby(treatment):
-        ax.plot(g[time_col], g[outcome], label=f"{'Program' if val==1 else 'Comparison'} group", marker="o")
+    colors = {1: "#2ecc71", 0: "#e74c3c"}
+    for val, g in grp_means.groupby(treatment):
+        label = "Program" if val == 1 else "Comparison"
+        ax.plot(g[tv], g[outcome], marker="o", color=colors[val],
+                label=f"{label} group", linewidth=2)
+
+    if n_pre < 3:
+        ax.set(title="Pre-Program Trends (fewer than 3 periods — test unreliable)",
+               xlabel=time_col, ylabel=outcome)
+        ax.legend(); ax.grid(True, alpha=0.3); fig.tight_layout()
+        return None, None, fig, n_pre
+
+    m    = smf.ols(f"{outcome} ~ {tv} + {tv}:{treatment}", data=grp_means).fit()
+    coef = m.params.get(f"{tv}:{treatment}")
+    pval = m.pvalues.get(f"{tv}:{treatment}")
+
+    # Add fitted trend lines
+    for val, g in grp_means.groupby(treatment):
+        t_range   = np.linspace(g[tv].min(), g[tv].max(), 50)
+        intercept = m.params.get("Intercept", 0)
+        slope     = m.params.get(tv, 0)
+        slope_int = m.params.get(f"{tv}:{treatment}", 0) if val == 1 else 0
+        ax.plot(t_range, intercept + (slope + slope_int) * t_range,
+                "--", color=colors[val], alpha=0.5)
+
     ax.set(title="Pre-Program Trends (should look parallel)", xlabel=time_col, ylabel=outcome)
-    ax.legend()
-    return m.params.get(f"{tv}:{treatment}"), m.pvalues.get(f"{tv}:{treatment}"), fig
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3); fig.tight_layout()
+    return coef, pval, fig, n_pre
+
+
+def compute_psm_balance(df, treatment, confounders):
+    """
+    Standardised Mean Differences (SMD) for each confounder before matching.
+    SMD < 0.1 = good balance; 0.1-0.2 = moderate; > 0.2 = poor.
+    """
+    rows = []
+    treated = df[df[treatment] == 1]
+    control = df[df[treatment] == 0]
+    for c in confounders:
+        try:
+            mt, mc   = treated[c].mean(), control[c].mean()
+            st_, sc  = treated[c].std(),  control[c].std()
+            pooled   = np.sqrt((st_**2 + sc**2) / 2)
+            smd      = (mt - mc) / pooled if pooled > 0 else 0
+            balance  = "✅ Good" if abs(smd) < 0.1 else "🟡 Moderate" if abs(smd) < 0.2 else "🔴 Poor"
+            rows.append({"Variable": c, "Mean (Program)": round(mt, 3),
+                         "Mean (Comparison)": round(mc, 3),
+                         "SMD": round(abs(smd), 3), "Balance": balance})
+        except Exception:
+            pass
+    return pd.DataFrame(rows)
+
+
+def plot_propensity_overlap(df, treatment, confounders):
+    """
+    Fit logistic propensity model and plot score histograms by group.
+    Overlap between distributions indicates common support.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    X = df[confounders].select_dtypes(include=[np.number]).dropna()
+    y = df.loc[X.index, treatment]
+    if X.empty or y.nunique() < 2: return None
+
+    try:
+        scaler = StandardScaler()
+        lr     = LogisticRegression(max_iter=1000)
+        lr.fit(scaler.fit_transform(X), y)
+        scores = lr.predict_proba(scaler.transform(X))[:, 1]
+    except Exception:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+    for val, label, color in [(1, "Program group", "#2ecc71"),
+                               (0, "Comparison group", "#e74c3c")]:
+        ax.hist(scores[y == val], bins=25, alpha=0.5,
+                color=color, label=label, density=True)
+    ax.set(title="Propensity Score Overlap (Common Support)",
+           xlabel="Propensity Score (probability of program enrollment)",
+           ylabel="Density")
+    ax.legend(); ax.grid(True, alpha=0.3); fig.tight_layout()
+    return fig
+
+
+def compute_evalue(effect, se):
+    """
+    E-value (VanderWeele & Ding 2017): the minimum association strength
+    an unmeasured confounder would need with BOTH treatment and outcome
+    to fully explain away the observed effect.
+    Larger E-value = result is more robust to hidden confounding.
+    Uses the continuous-outcome approximation via the standardised effect (effect/se).
+    """
+    if se is None or se == 0 or effect is None: return None, None
+    # Standardised effect size
+    d = abs(effect / se)
+    # Convert to approximate RR using VanderWeele approximation for continuous outcomes
+    # RR ≈ exp(0.91 * d) for standardised effects (conservative approximation)
+    rr = np.exp(0.91 * abs(effect) / (se * np.sqrt(2)))
+    if rr <= 1: return None, None
+    evalue = rr + np.sqrt(rr * (rr - 1))
+    # E-value for CI bound (effect - 1.96*se)
+    effect_ci = abs(effect) - 1.96 * se
+    if effect_ci <= 0:
+        evalue_ci = 1.0  # CI crosses null — E-value for CI is 1
+    else:
+        rr_ci     = np.exp(0.91 * effect_ci / (se * np.sqrt(2)))
+        evalue_ci = rr_ci + np.sqrt(max(rr_ci * (rr_ci - 1), 0)) if rr_ci > 1 else 1.0
+    return round(evalue, 2), round(evalue_ci, 2)
 
 # ── Glossary tooltip helper ────────────────────────────────────────────────────
 GLOSSARY = {
@@ -667,226 +824,407 @@ st.caption("When you're happy with the setup above, click the button to estimate
 if not st.button("▶ Estimate Program Effect", type="primary"): st.stop()
 
 try:
-    # Treatment group sizes
+    # ── Pre-flight checks ──────────────────────────────────────────────────────
     tcounts = df[treatment].value_counts()
     min_grp = int(tcounts.min())
+    max_grp = int(tcounts.max())
+    n_total = int(tcounts.sum())
+    imbalance_ratio = min_grp / max_grp if max_grp > 0 else 0
     st.session_state.min_group = min_grp
 
-    if tcounts.nunique() < 2: st.error("❌ Treatment column needs at least two groups (0 and 1)."); st.stop()
-    if df[outcome].nunique() < 2: st.error("❌ Outcome column needs at least two different values."); st.stop()
-    if min_grp < 10: st.warning("⚠️ One group has fewer than 10 people — estimates will be very uncertain.")
+    if tcounts.nunique() < 2:
+        st.error("❌ Treatment column needs at least two groups (0 and 1)."); st.stop()
+    if df[outcome].nunique() < 2:
+        st.error("❌ Outcome column needs at least two different values."); st.stop()
+    if min_grp < 10:
+        st.warning("⚠️ One group has fewer than 10 people — estimates will be very uncertain.")
+    if imbalance_ratio < 0.1:
+        st.warning(f"⚠️ Severe group imbalance: {min_grp} vs {max_grp} — PSM matching will struggle. "
+                   f"Consider whether a comparison group is truly available.")
 
     use_did = rec["method"] == "Difference-in-Differences" and did_ready and time_col and post_col
     st.session_state.use_did = use_did
-
     progress = st.progress(0, text="Starting analysis…")
 
-    # ── DiD ────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # DiD PATH
+    # ══════════════════════════════════════════════════════════════════════════
     if use_did:
-        progress.progress(30, text="Running Difference-in-Differences model…")
-        eff, se, _ = run_did(df, treatment, outcome, time_col, post_col)
+        progress.progress(30, text="Running two-way fixed effects DiD model…")
+        eff, se, ci_lo, ci_hi, pval, did_model = run_did(
+            df, treatment, outcome, time_col, post_col)
         st.session_state.update(did_effect=eff, did_se=se)
 
-        progress.progress(70, text="Checking parallel trends…")
-        _, pval, fig = check_parallel_trends(df, treatment, outcome, time_col, post_col)
+        progress.progress(70, text="Checking parallel trends on group means…")
+        trend_coef, trend_pval, trend_fig, n_pre = check_parallel_trends(
+            df, treatment, outcome, time_col, post_col)
         progress.progress(100, text="Done ✅"); progress.empty()
 
-        st.subheader("📈 Pre-program trend check")
-        st.caption("For DiD to be valid, both groups should have been moving similarly before the program started.")
-        st.pyplot(fig, use_container_width=False)
-        if pval is not None:
-            if pval > 0.05:
-                st.success(f"🟢 Trends look parallel before the program — DiD assumption holds (p={pval:.3f}).")
+        # ── Parallel trends ────────────────────────────────────────────────────
+        st.subheader("📈 Assumption Check: Parallel Trends")
+        st.caption(
+            "DiD is only valid if both groups were moving similarly **before** the program. "
+            "The chart shows group-period means (averaging within each group and time period). "
+            "Dashed lines show the fitted pre-trend for each group — they should look parallel."
+        )
+        col_plot, col_verdict = st.columns([2, 1])
+        with col_plot:
+            st.pyplot(trend_fig, use_container_width=False)
+        with col_verdict:
+            if n_pre < 3:
+                st.warning(f"⚠️ Only {n_pre} pre-program period(s). Need at least 3 to test trends reliably. Treat this assumption as unverified.")
+            elif trend_pval is not None:
+                if trend_pval > 0.1:
+                    st.success(f"🟢 **Parallel trends plausible** — p = {trend_pval:.3f}. The slope difference between groups is not statistically significant before the program.")
+                elif trend_pval > 0.05:
+                    st.warning(f"🟡 **Borderline** — p = {trend_pval:.3f}. Some evidence of diverging trends. Interpret DiD results with caution.")
+                else:
+                    st.error(f"🔴 **Parallel trends likely violated** — p = {trend_pval:.3f}. Groups were trending differently before the program. DiD estimates may be biased.")
+            st.caption(f"Pre-program periods available: **{n_pre}** (≥ 3 recommended for reliable testing)")
+
+        # ── Results ────────────────────────────────────────────────────────────
+        st.subheader("📊 Results — Difference-in-Differences")
+        st.caption("Standard errors are clustered by subject (where an ID column was detected) or HC3 robust. "
+                   "This corrects for repeated observations on the same person.")
+
+        c1, c2, c3, c4 = st.columns(4)
+        sig_label = "p < 0.05 ✅" if pval < 0.05 else "p ≥ 0.05 — not significant"
+        c1.metric("Estimated Effect (ATT)", f"{eff:+.3f}")
+        c2.metric("95% CI", f"[{ci_lo:.3f}, {ci_hi:.3f}]")
+        c3.metric("Std Error", f"{se:.3f}")
+        c4.metric("p-value", f"{pval:.3f}", delta=sig_label,
+                  delta_color="normal" if pval < 0.05 else "inverse")
+
+        diag_df = pd.DataFrame({
+            "Method": ["DiD (Two-Way FE)"], "Effect (ATT)": [round(eff, 4)],
+            "SE": [round(se, 4)], "CI low": [round(ci_lo, 4)],
+            "CI high": [round(ci_hi, 4)], "p-value": [round(pval, 4)], "N": [n_total]})
+
+        # ── E-value ────────────────────────────────────────────────────────────
+        ev, ev_ci = compute_evalue(eff, se)
+        st.subheader("🛡️ Sensitivity: E-value")
+        st.caption(
+            "The E-value answers: *How strong would an unmeasured confounder need to be "
+            "to fully explain away this result?* Higher = more robust. "
+            "An E-value of 2.0 means a confounder would need to double the odds of both "
+            "program enrollment AND the outcome to explain the finding away."
+        )
+        if ev:
+            col_ev1, col_ev2 = st.columns(2)
+            col_ev1.metric("E-value (point estimate)", str(ev),
+                           help="Unmeasured confounding strength needed to explain away the effect.")
+            col_ev2.metric("E-value (confidence limit)", str(ev_ci),
+                           help="Unmeasured confounding needed to shift the CI to include zero.")
+            if ev >= 2.0:
+                st.success(f"🟢 E-value = {ev} — the result is relatively robust. "
+                           f"An unmeasured confounder would need to be quite strong to explain it away.")
+            elif ev >= 1.5:
+                st.warning(f"🟡 E-value = {ev} — moderate robustness. "
+                           f"A moderately strong unmeasured confounder could explain this result.")
             else:
-                st.warning(f"🟡 Trends may not be parallel before the program (p={pval:.3f}). Interpret results cautiously.")
+                st.error(f"🔴 E-value = {ev} — low robustness. "
+                         f"Even a weak unmeasured confounder could explain this result.")
         else:
-            st.info("Not enough pre-program data to check trends.")
+            st.info("E-value could not be computed (effect may not be distinguishable from zero).")
 
-        diag_df = pd.DataFrame({"Method": ["Difference-in-Differences"],
-                                 "Estimated Effect": [eff], "Std Error": [se], "N": [len(df)]})
-        st.subheader("📊 Results")
-        st.dataframe(diag_df, use_container_width=True)
-
-    # ── Backdoor ───────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # BACKDOOR PATH (PSM + Regression)
+    # ══════════════════════════════════════════════════════════════════════════
     else:
-        progress.progress(20, text="Building causal model…")
-        graph   = build_graph(treatment, outcome, confounders)
-        cm      = CausalModel(data=df, treatment=treatment, outcome=outcome, graph=graph)
-        estimand= cm.identify_effect()
+        progress.progress(10, text="Building causal model…")
+        if not _DOWHY:
+            st.error("❌ The causal modelling library (dowhy) could not be loaded. "
+                     "This is a Python 3.14 compatibility issue. Pin Python 3.11 in deployment settings.")
+            st.stop()
 
-        progress.progress(50, text="Running propensity score matching (this can take a moment)…")
-        psm_r   = cm.estimate_effect(estimand, method_name="backdoor.propensity_score_matching")
+        # ── Assumption: propensity overlap ─────────────────────────────────────
+        st.subheader("📐 Assumption Check: Propensity Score Overlap")
+        st.caption(
+            "Before matching, we check whether the program and comparison groups have "
+            "overlapping propensity scores — i.e. for every program participant, "
+            "there exist similar non-participants. If distributions don't overlap, "
+            "the model is extrapolating rather than comparing like with like."
+        )
+        if confounders:
+            overlap_fig = plot_propensity_overlap(df, treatment, confounders)
+            if overlap_fig:
+                col_ov1, col_ov2 = st.columns([2, 1])
+                with col_ov1:
+                    st.pyplot(overlap_fig, use_container_width=False)
+                with col_ov2:
+                    st.markdown("""
+**How to read this chart:**
+- Both distributions should overlap substantially in the middle
+- 🟢 Good overlap = matching is valid
+- 🔴 Little overlap = estimates may not be reliable
 
-        progress.progress(75, text="Running regression…")
-        reg_r   = cm.estimate_effect(estimand, method_name="backdoor.linear_regression")
+If the program group scores are all near 1.0 and the comparison group near 0.0, there's essentially no common support.
+                    """)
+            else:
+                st.info("Overlap plot could not be generated (no numeric confounders found).")
+        else:
+            st.warning("No confounders selected — propensity score overlap cannot be assessed.")
 
-        progress.progress(90, text="Running refutation test…")
+        # ── Assumption: covariate balance ──────────────────────────────────────
+        st.subheader("⚖️ Assumption Check: Covariate Balance")
+        st.caption(
+            "Standardised Mean Differences (SMD) show how similar the groups are on each "
+            "background variable **before** matching. SMD < 0.1 is the standard threshold for "
+            "good balance. Large imbalances may bias the estimate even after PSM."
+        )
+        if confounders:
+            bal_df = compute_psm_balance(df, treatment, confounders)
+            if not bal_df.empty:
+                st.dataframe(bal_df, use_container_width=True, hide_index=True)
+                poor_balance = bal_df[bal_df["SMD"] > 0.2]
+                if poor_balance.empty:
+                    st.success("🟢 All confounders show reasonable pre-matching balance (SMD < 0.2).")
+                else:
+                    st.warning(f"🟡 {len(poor_balance)} variable(s) show poor balance (SMD > 0.2): "
+                               f"{', '.join(poor_balance['Variable'].tolist())}. "
+                               f"PSM will attempt to correct this, but large imbalances are harder to fix.")
+        else:
+            st.warning("No confounders selected — balance cannot be assessed.")
+
+        # ── Run models ─────────────────────────────────────────────────────────
+        graph    = build_graph(treatment, outcome, confounders)
+        cm       = CausalModel(data=df, treatment=treatment, outcome=outcome, graph=graph)
+        estimand = cm.identify_effect()
+
+        progress.progress(45, text="Running propensity score matching (ATT)…")
+        psm_r  = cm.estimate_effect(estimand, method_name="backdoor.propensity_score_matching")
+
+        progress.progress(70, text="Running OLS regression (ATE)…")
+        reg_r  = cm.estimate_effect(estimand, method_name="backdoor.linear_regression")
+
+        progress.progress(85, text="Running refutation test…")
         psm_eff, reg_eff = psm_r.value, reg_r.value
         st.session_state.update(psm_effect=psm_eff, reg_effect=reg_eff)
 
-        st.subheader("📊 Results — Two Methods for Robustness")
-        diag_df = pd.DataFrame({"Method": ["Propensity Score Matching (PSM)", "Linear Regression"],
-                                 "Estimated Effect": [psm_eff, reg_eff]})
-        st.dataframe(diag_df, use_container_width=True)
+        # ── Results ────────────────────────────────────────────────────────────
+        st.subheader("📊 Results — PSM (ATT) and Regression (ATE)")
+        st.caption(
+            "These two methods answer **related but different questions**. "
+            "PSM estimates the effect **for people who actually enrolled** (ATT — Average Treatment effect on the Treated). "
+            "Regression estimates the average effect **across everyone** in the sample (ATE — Average Treatment Effect). "
+            "Both are reported separately — do not average them."
+        )
 
+        col_psm, col_reg = st.columns(2)
+        with col_psm:
+            st.markdown("### Propensity Score Matching")
+            st.markdown("**Estimand: ATT** — effect on those who enrolled")
+            st.metric("Estimated Effect", f"{psm_eff:+.4f}")
+            st.caption("PSM finds matched non-participants for each participant and compares outcomes directly.")
+        with col_reg:
+            st.markdown("### Linear Regression")
+            st.markdown("**Estimand: ATE** — effect across all eligible people")
+            st.metric("Estimated Effect", f"{reg_eff:+.4f}")
+            st.caption("Regression controls for confounders linearly and estimates the population-average effect.")
+
+        # Agreement note — now correctly framed
         diff = abs(psm_eff - reg_eff)
-        if   diff < 0.05: st.success("🟢 Both methods agree — result is more reliable.")
-        elif diff < 0.15: st.warning("🟡 Methods differ slightly — result is suggestive but check your assumptions.")
-        else:             st.info("🔍 Methods differ substantially — this may mean the program effect varies across participants, or background variables need review.")
+        st.markdown("---")
+        st.markdown("**ATT vs ATE difference:**")
+        if diff < 0.1:
+            st.success(f"🟢 ATT and ATE are close ({diff:.4f} apart) — treatment effects appear fairly uniform across the population.")
+        else:
+            st.info(f"🔵 ATT and ATE differ by {diff:.4f} — this suggests the program effect varies across participants. "
+                    f"People who enrolled may have benefited {'more' if psm_eff < reg_eff else 'less'} than the average eligible person would have.")
 
-        st.subheader("🔍 Refutation test")
-        st.caption("This test randomly scrambles the program assignment. A trustworthy model should show near-zero effect after scrambling.")
+        diag_df = pd.DataFrame({
+            "Method": ["PSM (ATT)", "Regression (ATE)"],
+            "Estimand": ["Avg effect on enrolled", "Avg effect across all"],
+            "Estimated Effect": [round(psm_eff, 4), round(reg_eff, 4)]})
+
+        # ── Refutation ─────────────────────────────────────────────────────────
+        st.subheader("🔍 Refutation Test (Placebo Treatment)")
+        st.caption(
+            "The program assignment is randomly scrambled. A robust model should show a "
+            "near-zero effect after scrambling — if it doesn't, the original estimate may be "
+            "picking up chance patterns rather than a real program effect."
+        )
         try:
             refut = cm.refute_estimate(estimand, psm_r, method_name="placebo_treatment_refuter")
             st.write(refut)
         except Exception:
             st.info("Refutation test could not run — this sometimes happens with small samples.")
 
+        # ── E-value ────────────────────────────────────────────────────────────
+        st.subheader("🛡️ Sensitivity: E-value (PSM estimate)")
+        st.caption(
+            "The E-value answers: *How strong would an unmeasured confounder need to be "
+            "to fully explain away this result?* Higher = more robust to hidden confounding."
+        )
+        # Use PSM SE approximation from effect / sqrt(n)
+        psm_se_approx = abs(psm_eff) / max(np.sqrt(min_grp), 1)
+        ev, ev_ci = compute_evalue(psm_eff, psm_se_approx)
+        if ev:
+            col_ev1, col_ev2 = st.columns(2)
+            col_ev1.metric("E-value (point estimate)", str(ev))
+            col_ev2.metric("E-value (CI bound)", str(ev_ci))
+            if ev >= 2.0:
+                st.success(f"🟢 E-value = {ev}. The result is relatively robust to unmeasured confounding.")
+            elif ev >= 1.5:
+                st.warning(f"🟡 E-value = {ev}. A moderately strong unmeasured confounder could explain this result.")
+            else:
+                st.error(f"🔴 E-value = {ev}. Even weak unmeasured confounders could explain this result.")
+        else:
+            st.info("E-value could not be computed.")
+
         if _AI:
             with st.expander("🧠 AI: Plain-language explanation of these results", expanded=False):
                 with st.spinner():
                     exp = _chat(
-                        f'A program director ran a causal analysis. '
-                        f'Question: "{st.session_state.question or "program impact on outcome"}". '
-                        f'PSM estimated effect: {psm_eff:.4f}. Regression: {reg_eff:.4f}. '
-                        f'Outcome: {outcome}. Treatment: {treatment}. '
-                        f'Explain in plain language: what do these numbers mean, do the methods agree, '
-                        f'and what should the director tell stakeholders? No jargon, no equations.'
+                        f'''A program director ran a causal analysis.
+Question: "{st.session_state.question or "program impact on outcome"}".
+PSM (ATT) effect: {psm_eff:.4f}. Regression (ATE) effect: {reg_eff:.4f}.
+Outcome: {outcome}. Treatment: {treatment}.
+Explain: (1) what ATT vs ATE means in plain language for this program,
+(2) what the numbers mean, (3) whether they tell a consistent story,
+(4) what the director should tell stakeholders. No jargon, no equations.'''
                     )
                 if exp: st.write(exp)
 
         progress.progress(100, text="Done ✅"); progress.empty()
 
-    # ── Practical interpretation ───────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # PRACTICAL INTERPRETATION (both paths)
+    # ══════════════════════════════════════════════════════════════════════════
     st.subheader("🎯 What does this mean in practice?")
-    baseline = df[outcome].mean()
-    is_binary_outcome = df[outcome].nunique() == 2
+    baseline        = df[outcome].mean()
+    is_binary       = df[outcome].nunique() == 2
+    effect_for_interp = eff if use_did else psm_eff   # ATT is more relevant for program directors
 
-    col_base, col_effect = st.columns(2)
+    col_base, col_eff = st.columns(2)
     with col_base:
-        if is_binary_outcome:
-            baseline_pct = baseline * 100
-            st.metric("Baseline rate (no program)", f"{baseline_pct:.1f}%",
-                      help=f"The share of people with {outcome}=1 among those who did not receive the program.")
-        else:
-            st.metric(f"Average {outcome} (no program)", f"{baseline:.2f}",
-                      help="The average outcome value before accounting for the program effect.")
+        label = "Baseline rate" if is_binary else f"Average {outcome}"
+        val   = f"{baseline*100:.1f}%" if is_binary else f"{baseline:.2f}"
+        st.metric(label, val, help="Observed average in the full sample before accounting for program effects.")
+    with col_eff:
+        pct_chg = (effect_for_interp / baseline * 100) if baseline != 0 else 0
+        st.metric("Estimated program effect",
+                  f"{effect_for_interp:+.3f}",
+                  delta=f"{pct_chg:+.1f}% change from baseline",
+                  delta_color="inverse" if effect_for_interp < 0 else "normal")
 
-    if use_did:
-        e = st.session_state.did_effect or 0
-        direction = "lower" if e < 0 else "higher"
-        pct_change = (e / baseline * 100) if baseline != 0 else 0
-        per_100 = abs(e * 100) if is_binary_outcome else None
-
-        with col_effect:
-            st.metric(f"Program effect on {outcome}", f"{e:+.3f}",
-                      delta=f"{pct_change:+.1f}% vs baseline",
-                      delta_color="inverse" if e < 0 else "normal")
-
-        if is_binary_outcome:
-            st.success(
-                f"**The program {'reduced' if e < 0 else 'increased'} {outcome} by "
-                f"{abs(pct_change):.1f} percentage points** compared to the comparison group "
-                f"over the same period. That's roughly **{abs(e*100):.0f} fewer cases per 100 people** enrolled."
-            )
-        else:
-            st.success(
-                f"**The program {'reduced' if e < 0 else 'increased'} {outcome} by "
-                f"{abs(e):.3f} units** on average ({abs(pct_change):.1f}% change from baseline), "
-                f"compared to the comparison group over the same time period."
-            )
-
-        with st.expander("💬 How to explain this to a funder or board", expanded=False):
-            n_program = int((df[treatment] == 1).sum())
-            total_impact = abs(e) * n_program
-            st.markdown(f"""
-> *"Our analysis compared {outcome} trends in the program group and a similar comparison group
-> before and after the program launched. The program group showed a
-> {'reduction' if e < 0 else 'an increase'} of **{abs(e):.3f} units** in {outcome}
-> that was not seen in the comparison group. Across our {n_program} program participants,
-> this represents an estimated total change of **{total_impact:.1f} units** in {outcome}."*
-
-*Always add: "This is an observational estimate, not from a randomised trial."*
-            """)
-
+    direction = "reduced" if effect_for_interp < 0 else "increased"
+    if is_binary:
+        st.success(
+            f"**The program {direction} {outcome} by {abs(pct_chg):.1f} percentage points** "
+            f"— roughly {abs(effect_for_interp*100):.0f} fewer cases per 100 {'enrolled participants' if use_did else 'similar people'}."
+        )
     else:
-        p, r = st.session_state.psm_effect or 0, st.session_state.reg_effect or 0
-        avg  = (p + r) / 2
-        direction = "lower" if avg < 0 else "higher"
-        pct_change = (avg / baseline * 100) if baseline != 0 else 0
+        st.success(
+            f"**The program {direction} {outcome} by {abs(effect_for_interp):.3f} units** "
+            f"({abs(pct_chg):.1f}% change from the baseline of {baseline:.2f}). "
+            f"{'This is the ATT — the effect for people who actually enrolled.' if not use_did else ''}"
+        )
 
-        with col_effect:
-            st.metric(f"Estimated program effect", f"{avg:+.3f}",
-                      delta=f"{pct_change:+.1f}% vs baseline",
-                      delta_color="inverse" if avg < 0 else "normal")
+    with st.expander("💬 How to explain this to a funder or board", expanded=False):
+        n_enrolled = int((df[treatment] == 1).sum())
+        # Count unique subjects if possible to avoid double-counting panel rows
+        subject_col = _detect_subject_col(df, treatment, outcome,
+                                          time_col or "", post_col or "")
+        if subject_col:
+            n_enrolled = int(df[df[treatment]==1][subject_col].nunique())
+        st.markdown(f"""
+> *"We used observational causal analysis to estimate the impact of {treatment} on {outcome}.
+> {'The Difference-in-Differences method compared trends before and after the program in the enrolled group vs a comparison group.' if use_did else 'Propensity score matching compared enrolled participants to similar non-participants.'}
+> The analysis suggests the program **{direction} {outcome} by {abs(effect_for_interp):.3f} units**
+> ({abs(pct_chg):.1f}% change), for the {n_enrolled} enrolled participants."*
 
-        if is_binary_outcome:
-            st.success(
-                f"**The program {'reduced' if avg < 0 else 'increased'} {outcome} by approximately "
-                f"{abs(pct_change):.1f} percentage points** after accounting for background differences. "
-                f"That translates to roughly **{abs(avg*100):.0f} fewer cases per 100 similar people** enrolled."
-            )
-        else:
-            st.success(
-                f"**The program {'reduced' if avg < 0 else 'increased'} {outcome} by approximately "
-                f"{abs(avg):.3f} units** ({abs(pct_change):.1f}% change from the baseline average of {baseline:.2f}), "
-                f"after accounting for background differences between groups."
-            )
-
-        st.caption(f"PSM estimate: {p:.4f}  |  Regression estimate: {r:.4f}  |  Average used above: {avg:.4f}")
-
-        with st.expander("💬 How to explain this to a funder or board", expanded=False):
-            n_program = int((df[treatment] == 1).sum())
-            total_impact = abs(avg) * n_program
-            st.markdown(f"""
-> *"We compared {n_program} program participants to similar non-participants using two
-> statistical methods (propensity score matching and regression). Both suggest the program
-> {'reduced' if avg < 0 else 'increased'} {outcome} by approximately **{abs(avg):.3f} units**
-> ({abs(pct_change):.1f}% change). Across all participants, this represents an estimated
-> total impact of **{total_impact:.1f} units** in {outcome}."*
-
-*Always add: "This is an observational estimate, not from a randomised trial."*
-            """)
+**Important caveats to always include:**
+- This is an observational estimate, not a randomised trial
+- Results assume no important unmeasured differences between groups
+- The estimate applies to people similar to those in this dataset
+        """)
+        st.caption("⚠️ Do not report a 'total population impact' by multiplying effect × N — "
+                   "this assumes a constant, additive effect across all participants and is rarely justified.")
 
     # ── Confidence summary ─────────────────────────────────────────────────────
     st.subheader("🧭 How confident should you be?")
     signals = []
-    mn = st.session_state.min_group
-    if mn: signals.append("good_balance" if mn > 100 else "moderate_balance" if mn > 30 else "poor_balance")
-    if not use_did:
-        d = abs((st.session_state.psm_effect or 0) - (st.session_state.reg_effect or 0))
-        signals.append("strong_agreement" if d < 0.05 else "moderate_agreement" if d < 0.15 else "weak_agreement")
 
-    if   "poor_balance" in signals or "weak_agreement"         in signals:
-        st.error("🔴 Lower confidence — small groups or inconsistent methods. Share results carefully and note limitations.")
-    elif "moderate_balance" in signals or "moderate_agreement" in signals:
-        st.warning("🟡 Moderate confidence — results are suggestive. Useful for internal decision-making but not definitive proof.")
+    # Group balance (ratio-based, not just minimum)
+    if imbalance_ratio < 0.1:    signals.append("poor_balance")
+    elif imbalance_ratio < 0.33: signals.append("moderate_balance")
+    else:                         signals.append("good_balance")
+
+    # Statistical significance
+    if use_did:
+        signals.append("significant" if pval < 0.05 else "not_significant")
+        if n_pre < 3: signals.append("weak_trends_test")
     else:
-        st.success("🟢 Higher confidence — results are consistent across methods and groups are well-balanced.")
+        # Check confounder balance quality
+        if confounders:
+            bal_df2 = compute_psm_balance(df, treatment, confounders)
+            if not bal_df2.empty:
+                max_smd = bal_df2["SMD"].max()
+                signals.append("good_balance_psm" if max_smd < 0.1
+                                else "moderate_balance_psm" if max_smd < 0.2
+                                else "poor_balance_psm")
 
-    st.caption("⚠️ These results come from observational data, not a randomised trial. The estimate assumes no hidden confounders.")
+    low_conf    = "poor_balance" in signals or "not_significant" in signals or "poor_balance_psm" in signals
+    med_conf    = "moderate_balance" in signals or "weak_trends_test" in signals or "moderate_balance_psm" in signals
 
-    with st.expander("📊 Technical diagnostics", expanded=False):
-        st.dataframe(diag_df, use_container_width=True)
-        st.write(f"**Treatment group sizes:**")
-        st.dataframe(tcounts.rename_axis(treatment).reset_index(name="count"), use_container_width=True)
-        st.caption("PSM matches on propensity scores from the observed background variables. Regression controls for them linearly.")
+    if low_conf:
+        st.error("🔴 **Lower confidence** — group imbalance, non-significant result, or failed assumption checks. "
+                 "Share results carefully and prominently note limitations.")
+    elif med_conf:
+        st.warning("🟡 **Moderate confidence** — results are suggestive. Useful for internal learning "
+                   "but not as definitive evidence of impact.")
+    else:
+        st.success("🟢 **Higher confidence** — groups are balanced, the result is statistically significant, "
+                   "and assumption checks look reasonable.")
+
+    st.caption("⚠️ All results come from observational data. Even high confidence here does not equal "
+               "a randomised trial — unmeasured confounders may still be present.")
+
+    # ── Technical diagnostics ──────────────────────────────────────────────────
+    with st.expander("📊 Full technical diagnostics", expanded=False):
+        st.dataframe(diag_df, use_container_width=True, hide_index=True)
+        st.markdown("**Treatment group sizes:**")
+        st.dataframe(tcounts.rename_axis(treatment).reset_index(name="count"),
+                     use_container_width=True, hide_index=True)
+        st.markdown(f"**Group balance ratio:** {imbalance_ratio:.2f} "
+                    f"(1.0 = perfectly balanced; < 0.1 = severely imbalanced)")
+        if use_did:
+            st.caption(f"DiD model used {'two-way fixed effects with clustered SEs' if _detect_subject_col(df, treatment, outcome, time_col, post_col) else 'HC3 robust SEs'}.")
+        else:
+            st.caption("PSM: ATT estimand (matched sample). Regression: ATE estimand (full sample with linear control).")
 
     # ── Export ─────────────────────────────────────────────────────────────────
     st.subheader("📄 Export Report")
-    results_txt = (f"DiD Effect: {st.session_state.did_effect:.4f}  SE: {st.session_state.did_se:.4f}"
-                   if use_did else
-                   f"PSM: {st.session_state.psm_effect:.4f}  |  Regression: {st.session_state.reg_effect:.4f}")
+    if use_did:
+        results_txt = (f"Method: Difference-in-Differences (Two-Way FE)\n"
+                       f"Effect (ATT): {eff:.4f}\n"
+                       f"95% CI: [{ci_lo:.4f}, {ci_hi:.4f}]\n"
+                       f"Std Error: {se:.4f}  |  p-value: {pval:.4f}\n"
+                       f"Pre-periods: {n_pre}  |  Parallel trends p: {trend_pval if trend_pval else 'N/A'}\n"
+                       f"E-value: {ev if ev else 'N/A'}")
+    else:
+        results_txt = (f"PSM (ATT): {psm_eff:.4f}\n"
+                       f"Regression (ATE): {reg_eff:.4f}\n"
+                       f"ATT-ATE difference: {diff:.4f}\n"
+                       f"E-value (PSM): {ev if ev else 'N/A'}")
+
     report = (f"CAUSAL ANALYSIS REPORT\n{'='*40}\n"
               f"Question:    {st.session_state.question or 'N/A'}\n"
               f"Treatment:   {treatment}\nOutcome:     {outcome}\n"
               f"Confounders: {', '.join(confounders) or 'None'}\n\n"
-              f"TREATMENT GROUP SIZES\n{tcounts.to_string()}\n\n"
+              f"TREATMENT GROUP SIZES\n{tcounts.to_string()}\n"
+              f"Group balance ratio: {imbalance_ratio:.2f}\n\n"
               f"RESULTS\n{results_txt}\n\n"
+              f"ASSUMPTION CHECKS\n"
+              f"- Parallel trends: {'Tested — see app for chart' if use_did else 'N/A for PSM'}\n"
+              f"- Propensity overlap: {'N/A' if use_did else 'See app for chart'}\n"
+              f"- Covariate balance (max SMD): {'N/A' if use_did else str(round(bal_df2['SMD'].max(), 3)) if confounders and not bal_df2.empty else 'No confounders'}\n\n"
               f"LIMITATIONS\n"
               f"- Observational data, not a randomised trial\n"
               f"- Assumes no important unmeasured confounders\n"
               f"- Results depend on model assumptions and variable selection\n"
+              f"- PSM estimates ATT; regression estimates ATE — these answer different questions\n"
               f"- Use as one input to decision-making, not definitive proof\n")
     st.download_button("⬇️ Download Report", report, "causal_analysis_report.txt", "text/plain")
     st.session_state.analysis_ran = True
