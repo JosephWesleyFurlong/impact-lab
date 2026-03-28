@@ -1,13 +1,11 @@
-streamlit
-streamlit
-pandas
-numpy<2.0
-dowhy
-scikit-learn
-openai
-statsmodels==0.14.2
-
-# Graph stack (pin versions)
-graphviz==0.20
-pydot==1.4.2
-networkx==2.8
+streamlit>=1.35
+pandas>=2.0
+numpy>=1.26,<2.0
+matplotlib>=3.8
+statsmodels>=0.14
+scikit-learn>=1.4
+dowhy>=0.11
+networkx>=3.0
+graphviz>=0.20
+openai>=1.0
+pydot>=2.0
