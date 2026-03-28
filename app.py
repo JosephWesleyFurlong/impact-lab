@@ -1,959 +1,715 @@
-import streamlit as st
-import pandas as pd
+import json, os
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import statsmodels.formula.api as smf
+import streamlit as st
 from dowhy import CausalModel
-import os
 from graphviz import Digraph
 
-
-#st.write("API Key Loaded:", bool(os.getenv("OPENAI_API_KEY")))
 st.set_page_config(page_title="Causal Inference MVP", layout="wide")
 
-st.title("🧠 Causal Inference MVP for Program Evaluation")
+# ── Session state ──────────────────────────────────────────────────────────────
+for k, v in dict(treatment=None, outcome=None, confounders=[], df_clean=None,
+                 analysis_ran=False, use_did=False, psm_effect=None,
+                 reg_effect=None, did_effect=None, did_se=None,
+                 min_group=None, question="", dataset_explanation=None).items():
+    st.session_state.setdefault(k, v)
 
-# -----------------------------
-# Synthetic Data Generator
-# -----------------------------S
+# ── OpenAI helper ──────────────────────────────────────────────────────────────
+try:
+    from openai import OpenAI
+    _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    _AI = True
+except Exception:
+    _client = None; _AI = False
+
+def _chat(prompt, system="You are a causal inference expert helping program directors who are not statisticians."):
+    if not _AI: return None
+    try:
+        r = _client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": system},
+                      {"role": "user",   "content": prompt}])
+        return r.choices[0].message.content
+    except Exception as e:
+        st.warning(f"AI error: {e}"); return None
+
+# ── Data generators ────────────────────────────────────────────────────────────
 @st.cache_data
-def generate_data(n=1000, seed=42):
-    np.random.seed(seed)
+def generate_backdoor_data(n=1000, seed=42):
+    rng = np.random.default_rng(seed)
+    trauma = rng.normal(50, 10, n)
+    prior  = rng.poisson(2, n)
+    ment   = rng.binomial(1, 1/(1+np.exp(-(0.05*trauma+0.3*prior))))
+    disrupt= rng.binomial(1, 1/(1+np.exp(-(0.04*trauma+0.5*prior-0.8*ment))))
+    return pd.DataFrame({"age": rng.integers(5,18,n), "trauma_score": trauma,
+                         "prior_placements": prior, "mentoring": ment, "disruption": disrupt})
 
-    age = np.random.randint(5, 18, size=n)
-    trauma = np.random.normal(50, 10, size=n)
-    prior_placements = np.random.poisson(2, size=n)
+@st.cache_data
+def generate_did_data(n=1000, seed=42):
+    """
+    Realistic DiD dataset: youth mentoring program evaluated across 10 quarters.
+    - program_enrolled: 1 if the youth was enrolled in the mentoring program, 0 if comparison group
+    - quarter: observation period (1-10); program launched at quarter 6 (post=1)
+    - post_launch: 1 for quarters 6-10, 0 for quarters 1-5
+    - age, prior_placements: background variables (confounders)
+    - placement_disruptions: outcome — number of placement disruptions that quarter
+    """
+    rng = np.random.default_rng(seed)
+    n_subjects = n // 10
+    subject_ids = np.repeat(np.arange(n_subjects), 10)
+    quarter = np.tile(np.arange(1, 11), n_subjects)
+    enrolled = np.repeat(rng.binomial(1, 0.5, n_subjects), 10)
+    post_launch = (quarter >= 6).astype(int)
 
-    # Treatment assignment (confounded)
-    mentoring_prob = 1 / (1 + np.exp(-(0.05*trauma + 0.3*prior_placements)))
-    mentoring = np.random.binomial(1, mentoring_prob)
+    # Subject-level background variables (constant across quarters)
+    age            = np.repeat(rng.integers(8, 18, n_subjects), 10)
+    prior_placements = np.repeat(rng.poisson(2, n_subjects), 10)
 
-    # Outcome (true causal effect included)
-    disruption_prob = 1 / (1 + np.exp(
-        -(0.04*trauma + 0.5*prior_placements - 0.8*mentoring)
-    ))
-    disruption = np.random.binomial(1, disruption_prob)
+    # Outcome: baseline trend + program effect after launch + noise
+    baseline_trend = 0.15 * quarter
+    program_effect = enrolled * post_launch * (-1.8)   # true ATT: -1.8 disruptions/quarter
+    noise          = rng.normal(0, 0.8, len(quarter))
+    placement_disruptions = np.clip(2 + baseline_trend + program_effect + 0.05 * prior_placements + noise, 0, None).round(1)
 
-    df = pd.DataFrame({
-        "age": age,
-        "trauma_score": trauma,
-        "prior_placements": prior_placements,
-        "mentoring": mentoring,
-        "disruption": disruption
+    return pd.DataFrame({
+        "subject_id":           subject_ids,
+        "quarter":              quarter,
+        "program_enrolled":     enrolled,
+        "post_launch":          post_launch,
+        "age":                  age,
+        "prior_placements":     prior_placements,
+        "placement_disruptions": placement_disruptions,
     })
 
-    return df
-
-
+# ── Variable helpers ───────────────────────────────────────────────────────────
 def suggest_variables(df):
-    columns = df.columns.tolist()
-
-    treatment = None
-    outcome = None
-    confounders = []
-
-    for col in columns:
-        if any(x in col.lower() for x in ["treat", "program", "mentoring", "intervention"]):
-            treatment = col
-            break
-
-    for col in columns:
-        if any(x in col.lower() for x in ["outcome", "result", "disruption", "success"]):
-            outcome = col
-            break
-
-    if not treatment:
-        treatment = columns[-2]
-
-    if not outcome:
-        outcome = columns[-1]
-
-    confounders = [c for c in columns if c not in [treatment, outcome]]
-
-    return treatment, outcome, confounders
-
-from openai import OpenAI
-import json
-
-client = OpenAI()
-
-
-
+    cols = df.columns.tolist()
+    treatment_keywords = ["treat","program","enroll","intervention","mentoring","assigned","group","cohort","participant"]
+    outcome_keywords   = ["outcome","result","disruption","success","score","rate","count","incident","event","measure"]
+    # Exclude obvious non-variable columns from candidacy
+    exclude_keywords   = ["id","time","date","year","quarter","month","week","period","post","before","after","wave"]
+    candidates = [c for c in cols if not any(x in c.lower() for x in exclude_keywords)]
+    t = next((c for c in candidates if any(x in c.lower() for x in treatment_keywords)), None)
+    o = next((c for c in candidates if any(x in c.lower() for x in outcome_keywords) and c != t), None)
+    # Fallbacks: avoid time/post columns
+    if t is None: t = candidates[-2] if len(candidates) >= 2 else cols[-2]
+    if o is None: o = candidates[-1] if candidates and candidates[-1] != t else cols[-1]
+    return t, o, [c for c in cols if c not in (t, o)]
 
 def ai_suggest_variables(question, columns):
-    prompt = f"""
-You are helping build a causal inference model.
-
-Dataset columns:
-{columns}
-
-User question:
-"{question}"
-
-Return ONLY valid JSON with:
-- treatment (must be one of the columns)
-- outcome (must be one of the columns)
-- confounders (list of columns)
-
-Rules:
-- Only use column names from the dataset
-- Choose the most likely causal interpretation
-- Confounders should influence both treatment and outcome
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a causal inference expert."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-
+    raw = _chat(f'Dataset columns: {columns}\nQuestion: "{question}"\n'
+                'Return ONLY valid JSON (no fences) with keys: treatment, outcome, confounders.')
+    if not raw: return None
     try:
-        result = json.loads(response.choices[0].message.content)
-        return result
-    except:
+        return json.loads(raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+    except json.JSONDecodeError:
         return None
 
-def explain_method_agreement(question, treatment, outcome, confounders, psm, reg):
-    prompt = f"""
-You are helping interpret causal inference results.
+# ── Recommender ────────────────────────────────────────────────────────────────
+def recommend_approach(df):
+    cols = df.columns.str.lower()
+    time_keywords = ["time", "date", "year", "quarter", "month", "week", "period", "wave", "visit", "survey"]
+    post_keywords = ["post", "after", "launch", "intervention", "follow"]
+    has_time = any(any(kw in c for kw in time_keywords) for c in cols)
+    has_post = any(any(kw in c for kw in post_keywords) for c in cols)
+    if has_time and has_post:
+        return {"method": "Difference-in-Differences",
+                "reason": "Your data tracks people over time and has a clear before/after intervention point."}
+    if has_time:
+        return {"method": "Interrupted Time Series",
+                "reason": "Your data has a time dimension but no separate comparison group."}
+    return {"method": "Backdoor (PSM / Regression)",
+            "reason": "Your data is a single snapshot in time with background variables that may affect who received the program."}
 
-User question:
-"{question}"
-
-Model:
-- Treatment: {treatment}
-- Outcome: {outcome}
-- Confounders: {confounders}
-
-Results:
-- Propensity Score Matching (PSM): {psm}
-- Linear Regression: {reg}
-
-Explain:
-1. Whether the methods agree or differ
-2. Why regression might show a smaller effect than PSM
-3. What this means for interpreting the results
-
-Important:
-- Differences do NOT necessarily mean one method is wrong
-- Highlight concepts like heterogeneity, overlap, and model assumptions
-- Keep it clear and practical for a non-technical audience
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return response.choices[0].message.content
-
-def explain_causal_model(question, treatment, outcome, confounders):
-    prompt = f"""
-You are helping explain a causal inference model in plain language.
-
-User question:
-"{question}"
-
-Model:
-- Treatment: {treatment}
-- Outcome: {outcome}
-- Confounders: {confounders}
-
-Explain:
-1. Why this treatment and outcome were chosen
-2. Why the confounders matter
-3. What assumptions are being made
-
-Keep it simple and clear for a non-technical audience.
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return response.choices[0].message.content
-
-def explain_method_differences(question, treatment, outcome, confounders, psm, reg):
-    prompt = f"""
-You are helping explain differences between causal inference methods.
-
-User question:
-"{question}"
-
-Model:
-- Treatment: {treatment}
-- Outcome: {outcome}
-- Confounders: {confounders}
-
-Results:
-- Propensity Score Matching: {psm}
-- Linear Regression: {reg}
-
-Explain:
-1. Why these methods might give different results
-2. What assumptions differ
-3. When to trust each method
-
-Keep it simple and practical for a non-technical audience.
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return response.choices[0].message.content
-
-# -----------------------------
-# AI Data Understanding (NEW)
-# -----------------------------
-def describe_dataset(df):
-    summary = {
-        "columns": list(df.columns),
-        "num_rows": len(df),
-        "dtypes": df.dtypes.astype(str).to_dict(),
-        "missing": df.isnull().sum().to_dict()
-    }
-
-    prompt = f"""
-You are helping a program evaluator understand their dataset.
-
-Here is the dataset summary:
-{summary}
-
-Explain:
-1. What this dataset likely represents
-2. Which variables could be treatments, outcomes, or confounders
-3. Any data quality issues
-
-Keep it simple and practical.
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return response.choices[0].message.content
-
-
-def check_data_readiness(df, treatment, outcome, confounders):
+# ── Data quality ───────────────────────────────────────────────────────────────
+def check_readiness(df, treatment, outcome, confounders):
     issues = []
-
-    if df[treatment].nunique() < 2:
-        issues.append("Treatment has no variation")
-
-    if df[outcome].nunique() < 2:
-        issues.append("Outcome has no variation")
-
-    missing = df[[treatment, outcome] + confounders].isnull().sum().sum()
-    if missing > 0:
-        issues.append("Missing values detected")
-
+    if df[treatment].nunique() < 2: issues.append("The treatment column has only one value — there's no comparison group.")
+    if df[outcome].nunique()   < 2: issues.append("The outcome column has only one value — there's nothing to measure change in.")
+    missing = df[[treatment, outcome, *confounders]].isnull().sum().sum()
+    if missing: issues.append(f"{int(missing)} missing values detected in key columns.")
+    if len(df) < 100: issues.append(f"Small sample ({len(df)} rows) — estimates may be unreliable. At least 100 rows are recommended.")
     return issues
 
+def auto_clean(df, treatment, outcome, confounders):
+    df = df.dropna(subset=[treatment, outcome]).copy()
+    for col in [treatment, outcome, *confounders]:
+        try: df[col] = pd.to_numeric(df[col])
+        except: pass
+    rename = {c: c.strip().lower().replace(" ","_") for c in df.columns}
+    return df.rename(columns=rename), rename
 
-def suggest_fixes(df, issues):
-    prompt = f"""
-A dataset has the following issues:
-{issues}
+# ── Causal methods ─────────────────────────────────────────────────────────────
+def build_graph(treatment, outcome, confounders):
+    edges = [f"{treatment} -> {outcome};"]
+    for c in confounders: edges += [f"{c} -> {treatment};", f"{c} -> {outcome};"]
+    return "digraph {\n" + "\n".join(edges) + "\n}"
 
-Suggest simple ways to fix them using pandas or Excel.
+def run_did(df, treatment, outcome, time_col, post_col):
+    for col in [treatment, outcome, time_col, post_col]:
+        if col not in df.columns: raise ValueError(f"Missing column: {col}")
+    if df[treatment].nunique() < 2: raise ValueError("Treatment needs 0 and 1.")
+    if df[post_col].nunique()  < 2: raise ValueError("Post variable needs 0 and 1.")
+    model = smf.ols(f"{outcome} ~ {treatment} + {post_col} + {treatment}:{post_col}", data=df).fit()
+    ix = f"{treatment}:{post_col}"
+    return model.params.get(ix), model.bse.get(ix), model
 
-Keep suggestions beginner-friendly.
-"""
+def check_parallel_trends(df, treatment, outcome, time_col, post_col):
+    pre = df[df[post_col] == 0].copy().sort_values(time_col)
+    tv  = time_col if pd.api.types.is_numeric_dtype(pre[time_col]) else "time_index"
+    if tv == "time_index": pre["time_index"] = range(len(pre))
+    m   = smf.ols(f"{outcome} ~ {tv} + {tv}:{treatment}", data=pre).fit()
+    fig, ax = plt.subplots(figsize=(6, 3))
+    for val, g in pre.groupby(treatment):
+        ax.plot(g[time_col], g[outcome], label=f"{'Program' if val==1 else 'Comparison'} group", marker="o")
+    ax.set(title="Pre-Program Trends (should look parallel)", xlabel=time_col, ylabel=outcome)
+    ax.legend()
+    return m.params.get(f"{tv}:{treatment}"), m.pvalues.get(f"{tv}:{treatment}"), fig
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
+# ── Glossary tooltip helper ────────────────────────────────────────────────────
+GLOSSARY = {
+    "confounder":   "A background variable that influences both who gets the program AND the outcome — e.g. prior trauma affecting both program assignment and disruptions.",
+    "PSM":          "Propensity Score Matching — pairs each program participant with a similar non-participant to estimate the program's effect.",
+    "DiD":          "Difference-in-Differences — compares how the outcome changed over time in the program group vs a comparison group.",
+    "ATE":          "Average Treatment Effect — the estimated average impact of the program across all participants.",
+    "DAG":          "Directed Acyclic Graph — a diagram showing your assumptions about how variables relate causally.",
+    "parallel trends": "The assumption in DiD that, without the program, both groups would have followed similar trends over time.",
+}
 
-    return response.choices[0].message.content
+def glossary_tip(term):
+    return f"**{term}** — _{GLOSSARY.get(term, '')}_ "
 
+# ══════════════════════════════════════════════════════════════════════════════
+# UI — Title
+# ══════════════════════════════════════════════════════════════════════════════
+st.title("🧠 Causal Inference for Program Evaluation")
+st.caption("Walk through the steps below to estimate whether your program caused a change in outcomes.")
+if not _AI: st.info("💡 AI guidance is disabled — set the OPENAI_API_KEY environment variable to enable it.")
 
-# -----------------------------
-# Auto Clean Pipeline (UPDATED)
-# -----------------------------
-def auto_clean_data(df, treatment, outcome, confounders):
-    df_clean = df.copy()
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — Load Data
+# ══════════════════════════════════════════════════════════════════════════════
+st.header("Step 1 — Load Your Data")
 
-    # -----------------------------
-    # Drop missing key variables
-    # -----------------------------
-    df_clean = df_clean.dropna(subset=[treatment, outcome])
+src = st.radio("Choose data source:", ["Upload CSV", "Sample: Youth Mentoring (Cross-sectional)", "Sample: Program Cohort (Panel/DiD)"],
+               horizontal=True)
 
-    # -----------------------------
-    # Convert numeric columns where possible
-    # -----------------------------
-    for col in [treatment, outcome] + confounders:
-        try:
-            df_clean[col] = pd.to_numeric(df_clean[col])
-        except:
-            pass
-
-    # -----------------------------
-    # Create safe rename map
-    # -----------------------------
-    rename_map = {
-        col: col.strip().lower().replace(" ", "_")
-        for col in df_clean.columns
-    }
-
-    # -----------------------------
-    # Apply renaming
-    # -----------------------------
-    df_clean = df_clean.rename(columns=rename_map)
-
-    # -----------------------------
-    # Return BOTH cleaned data and mapping
-    # -----------------------------
-    return df_clean, rename_map
-
-
-# -----------------------------
-# Data Section
-# -----------------------------
-st.sidebar.header("1. Data")
-
-data_option = st.sidebar.radio(
-    "Choose data source:",
-    ["Use synthetic data", "Upload CSV"]
-)
-
-if data_option == "Use synthetic data":
-    df = generate_data()
-    st.sidebar.success("Synthetic dataset loaded")
+if src == "Sample: Youth Mentoring (Cross-sectional)":
+    df_raw = generate_backdoor_data()
+    st.success("Sample dataset loaded — 1,000 youth records with mentoring program and placement disruption outcome.")
+elif src == "Sample: Program Cohort (Panel/DiD)":
+    df_raw = generate_did_data()
+    st.success("Sample dataset loaded — panel data with treatment group, time, and post-intervention indicator.")
 else:
-    uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-    if uploaded_file:
-        df = pd.read_csv(uploaded_file)
-    else:
+    f = st.file_uploader("Upload your CSV file", type=["csv"])
+    if not f:
+        st.info("👆 Upload a CSV to get started. Each row should represent one person or one observation period.")
         st.stop()
+    df_raw = pd.read_csv(f)
 
-# -----------------------------
-# Use cleaned data if available
-# -----------------------------
-if "df_clean" in st.session_state:
-    df = st.session_state.df_clean
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — Understand Your Data
+# ══════════════════════════════════════════════════════════════════════════════
+st.header("Step 2 — Understand Your Data")
 
-    col1, col2 = st.columns([3,1])
+df = st.session_state.df_clean if st.session_state.df_clean is not None else df_raw
 
-    with col1:
-        st.info("✨ Using cleaned dataset")
+col_prev, col_stats = st.columns([3, 1])
+with col_prev:
+    st.subheader("Preview")
+    st.dataframe(df.head(10), use_container_width=True)
+with col_stats:
+    st.subheader("At a glance")
+    st.metric("Rows", f"{len(df):,}")
+    st.metric("Columns", len(df.columns))
+    missing = df.isnull().sum().sum()
+    st.metric("Missing values", int(missing), delta=None if missing == 0 else "⚠️ present", delta_color="inverse")
 
-    with col2:
-        if st.button("Undo"):
-            del st.session_state.df_clean
+if _AI:
+    with st.expander("🧠 What does this data represent? (AI explanation)", expanded=False):
+        # Auto-run explanation when expander is opened, cache in session state
+        if st.session_state.dataset_explanation is None:
+            with st.spinner("Analysing your dataset…"):
+                st.session_state.dataset_explanation = _chat(
+                    f'Explain this dataset plainly to a program director (not a statistician). '
+                    f'Columns: {df.columns.tolist()}, rows: {len(df)}, '
+                    f'dtypes: {df.dtypes.astype(str).to_dict()}, '
+                    f'sample values: {df.head(3).to_dict()}. '
+                    f'Cover: (1) what this dataset likely represents, '
+                    f'(2) which column is probably the program/treatment, '
+                    f'(3) which column is probably the outcome, '
+                    f'(4) any obvious data quality concerns. Use plain language, no jargon.'
+                )
+        if st.session_state.dataset_explanation:
+            st.write(st.session_state.dataset_explanation)
+        if st.button("🔄 Re-explain"):
+            st.session_state.dataset_explanation = None
             st.rerun()
 
-st.subheader("Preview Data")
-st.dataframe(df.head())
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Clean Your Data
+# ══════════════════════════════════════════════════════════════════════════════
+st.header("Step 3 — Clean Your Data")
 
-# -----------------------------
-# AI Data Understanding (NEW)
-# -----------------------------
-with st.expander("🧠 Understand Your Data", expanded=False):
+if st.session_state.df_clean is not None:
+    c1, c2 = st.columns([4, 1])
+    c1.success("✅ Using cleaned dataset")
+    if c2.button("↩ Undo clean"): st.session_state.df_clean = None; st.rerun()
+else:
+    st.write("Auto-clean will: remove rows with missing program/outcome data, convert text numbers to numeric, and standardise column names.")
+    if st.button("✨ Clean My Data", type="primary"):
+        # Need treatment/outcome to be set for cleaning — use heuristic defaults if not yet set
+        t_default, o_default, c_default = suggest_variables(df_raw)
+        t_clean = st.session_state.treatment or t_default
+        o_clean = st.session_state.outcome   or o_default
+        c_clean = st.session_state.confounders or c_default
+        df_c, rmap = auto_clean(df_raw, t_clean, o_clean, c_clean)
+        st.session_state.update(df_clean=df_c,
+                                dataset_explanation=None,   # reset so AI re-explains cleaned data
+                                treatment=rmap.get(t_clean, t_clean),
+                                outcome=rmap.get(o_clean, o_clean),
+                                confounders=[rmap.get(c, c) for c in c_clean])
+        st.success(f"✅ Cleaned — {len(df_raw)-len(df_c)} rows removed, {len(df_c):,} rows remaining.")
+        with st.expander("🔍 Column name changes"): st.json(rmap)
+        st.rerun()
 
-    if st.button("Explain My Dataset"):
-        explanation = describe_dataset(df)
-        st.write(explanation)
+# Refresh df after potential clean
+df = st.session_state.df_clean if st.session_state.df_clean is not None else df_raw
 
-# -----------------------------
-# Optional AI Assistant
-# -----------------------------
-st.divider()
-st.subheader("💬 Ask Your Evaluation Question (Optional)")
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — Define Your Model
+# ══════════════════════════════════════════════════════════════════════════════
+st.header("Step 4 — Define Your Model")
 
-st.caption("Type a question and press Enter or click submit to get help selecting variables.")
-
-# Initialize session state if needed
-if "treatment" not in st.session_state:
-    st.session_state.treatment = None
-    st.session_state.outcome = None
-    st.session_state.confounders = []
-
-# Use a form so Enter submits properly
-with st.form("question_form"):
-    question = st.text_input(
-        "Example: Did mentoring reduce placement disruptions?"
-    )
-
-    submitted = st.form_submit_button("✨ Suggest Model")
-
-    if submitted:
-        if not question:
-            st.warning("Please enter a question or use manual selection below.")
-        else:
-            st.info(f"Interpreting question: '{question}'")
-
-            try:
-                ai_result = ai_suggest_variables(question, df.columns.tolist())
-            except Exception as e:
-                st.warning("AI service error. Falling back to default.")
-                ai_result = None
-
-            if ai_result:
-                t = ai_result.get("treatment")
-                o = ai_result.get("outcome")
-                c = ai_result.get("confounders", [])
-
-                # ✅ Validate AI output
-                valid_columns = df.columns.tolist()
-                if t not in valid_columns or o not in valid_columns:
-                    st.warning("AI returned invalid columns. Using fallback.")
-                    ai_result = None
-                else:
-                    st.session_state.treatment = t
-                    st.session_state.outcome = o
-                    st.session_state.confounders = c
-
-                    st.success("AI suggested a model. You can adjust below.")
-
-                    # 🧠 Explanation
-                    explanation = explain_causal_model(question, t, o, c)
-
-                    st.subheader("🧠 Why this model?")
-                    st.write(explanation)
-
-                    st.json(ai_result)
-
-            if not ai_result:
-                st.warning("Using default variable selection.")
-
+# ── 4a: AI question ────────────────────────────────────────────────────────────
+if _AI:
+    st.subheader("4a — Describe your evaluation question (optional)")
+    st.caption("Type your question in plain language and AI will suggest which columns to use.")
+    with st.form("qform"):
+        q = st.text_input("e.g. Did the mentoring program reduce placement disruptions?",
+                          value=st.session_state.question)
+        if st.form_submit_button("✨ Suggest Variables") and q:
+            st.session_state.question = q
+            with st.spinner("Interpreting your question…"):
+                res = ai_suggest_variables(q, df.columns.tolist())
+            valid = df.columns.tolist()
+            if res and res.get("treatment") in valid and res.get("outcome") in valid:
+                st.session_state.update(treatment=res["treatment"], outcome=res["outcome"],
+                                        confounders=[c for c in res.get("confounders", []) if c in valid])
+                st.success("Variables suggested — review and adjust below.")
+                exp = _chat(f'A program director asked: "{q}". '
+                            f'We set up: treatment={res["treatment"]}, outcome={res["outcome"]}, '
+                            f'confounders={res.get("confounders",[])}. '
+                            f'Explain in 3 short bullet points why these choices make sense causally. '
+                            f'Use plain language, no equations.')
+                if exp: st.info(exp)
+                st.json(res)
+            else:
+                st.warning("Couldn't match your question to columns — please select variables manually below.")
                 t, o, c = suggest_variables(df)
+                st.session_state.update(treatment=t, outcome=o, confounders=c)
 
-                st.session_state.treatment = t
-                st.session_state.outcome = o
-                st.session_state.confounders = c
+# ── 4b: Manual variable selection ─────────────────────────────────────────────
+st.subheader("4b — Select variables")
 
-                st.success("Default model applied. You can adjust below.")
+# Glossary inline
+with st.expander("📖 What do these terms mean?", expanded=False):
+    for term in ["confounder", "PSM", "DiD", "DAG"]:
+        st.markdown(glossary_tip(term))
 
+cols = df.columns.tolist()
+if st.session_state.treatment not in cols: st.session_state.treatment = cols[0]
+if st.session_state.outcome   not in cols: st.session_state.outcome   = cols[1] if len(cols)>1 else cols[0]
+st.session_state.confounders = [c for c in st.session_state.confounders if c in cols]
 
-# -----------------------------
-# Variable Selection
-# -----------------------------
-st.sidebar.header("2. Define Variables")
+col_t, col_o, col_c = st.columns(3)
+with col_t:
+    treatment = st.selectbox("🟢 Program / Treatment variable",
+                             cols, index=cols.index(st.session_state.treatment),
+                             help="The column that indicates whether someone received the program (usually 0/1).")
+with col_o:
+    outcome = st.selectbox("🔴 Outcome variable",
+                           cols, index=cols.index(st.session_state.outcome),
+                           help="The result you're trying to change — e.g. placement disruptions, test scores.")
+with col_c:
+    confounders = st.multiselect("🔵 Background variables (confounders)",
+                                 [c for c in cols if c not in (treatment, outcome)],
+                                 default=[c for c in st.session_state.confounders if c not in (treatment, outcome)],
+                                 help="Variables that affect both who got the program AND the outcome — e.g. age, prior history.")
 
-columns = df.columns.tolist()
-
-treatment = st.selectbox(
-    "Treatment Variable",
-    columns,
-    index=columns.index(st.session_state.treatment)
-    if st.session_state.treatment in columns else 0
-)
-
-outcome = st.selectbox(
-    "Outcome Variable",
-    columns,
-    index=columns.index(st.session_state.outcome)
-    if st.session_state.outcome in columns else 1
-)
-
-confounders = st.multiselect(
-    "Confounders",
-    [c for c in columns if c not in [treatment, outcome]],
-    default=[c for c in st.session_state.confounders if c not in [treatment, outcome]]
-)
-
-
-st.session_state.treatment = treatment
-st.session_state.outcome = outcome
-st.session_state.confounders = confounders
-
-# -----------------------------
-# Data Readiness Check (NEW)
-# -----------------------------
-st.subheader("🧪 Data Readiness Check")
-
-issues = check_data_readiness(df, treatment, outcome, confounders)
-
-if not issues:
-    st.success("✅ Data looks ready for causal analysis")
-else:
-    for issue in issues:
-        st.warning(issue)
-
-    if st.button("🛠 Suggest Fixes"):
-        fixes = suggest_fixes(df, issues)
-        st.write(fixes)
-
-# -----------------------------
-# Recommended Analysis Approach (NEW)
-# -----------------------------
-st.subheader("🧭 Recommended Analysis Approach")
-
-if not issues:
-    recommendation = recommend_analysis_approach(df)
-
-    st.info(f"**Suggested Method:** {recommendation['method']}")
-
-    st.write(f"**Why:** {recommendation['reason']}")
-
-    st.caption(
-        "This recommendation is based on the structure of your dataset. "
-        "You can still choose alternative methods below."
-    )
-else:
-    st.info("Resolve data issues to receive a modeling recommendation.")
-
-    
-# -----------------------------
-# Method Recommendation (NEW)
-# -----------------------------
-def recommend_analysis_approach(df):
-    cols = df.columns.str.lower()
-
-    has_time = any("time" in c or "date" in c or "year" in c for c in cols)
-    has_post = any("post" in c for c in cols)
-    has_group = any("group" in c or "cohort" in c for c in cols)
-
-    if has_time and has_post:
-        return {
-            "method": "Difference-in-Differences",
-            "reason": "Your data includes time and a post/intervention indicator."
-        }
-    elif has_time:
-        return {
-            "method": "Interrupted Time Series",
-            "reason": "Your data includes a time variable but no clear comparison group."
-        }
-    else:
-        return {
-            "method": "Backdoor (PSM / Regression)",
-            "reason": "Your data appears cross-sectional with confounders."
-        }
-
-# -----------------------------
-# Auto Clean Button (UPDATED)
-# -----------------------------
-if st.button("✨ Clean My Data"):
-
-    # Run cleaning + get rename map
-    df_clean, rename_map = auto_clean_data(df, treatment, outcome, confounders)
-
-    # -----------------------------
-    # Update variable names safely
-    # -----------------------------
-    treatment = rename_map.get(treatment, treatment)
-    outcome = rename_map.get(outcome, outcome)
-    confounders = [rename_map.get(c, c) for c in confounders]
-
-    # -----------------------------
-    # Store cleaned data + updated variables
-    # -----------------------------
-    st.session_state.df_clean = df_clean
-    st.session_state.treatment = treatment
-    st.session_state.outcome = outcome
-    st.session_state.confounders = confounders
-
-    # -----------------------------
-    # Feedback to user
-    # -----------------------------
-    st.success("Data cleaned and variable names updated")
-
-    st.subheader("Preview Cleaned Data")
-    st.dataframe(df_clean.head())
-
-    # Optional: show rename mapping (great UX)
-    with st.expander("🔍 Column Name Changes", expanded=False):
-        st.json(rename_map)
-# -----------------------------
-# Build DAG
-# -----------------------------
-def build_graph(treatment, outcome, confounders):
-    graph = "digraph {\n"
-    graph += f"{treatment} -> {outcome};\n"
-
-    for c in confounders:
-        graph += f"{c} -> {treatment};\n"
-        graph += f"{c} -> {outcome};\n"
-
-    graph += "}"
-    return graph
-
-graph = build_graph(treatment, outcome, confounders)
-
-st.subheader("Causal Graph (DAG)")
-
-dot = Digraph()
-
-# Style nodes
-dot.attr('node', shape='box', style='filled', color='lightblue')
-
-# Treatment node (highlight)
-dot.node(treatment, treatment, color='lightgreen')
-
-# Outcome node (highlight)
-dot.node(outcome, outcome, color='lightcoral')
-
-# Edges
-dot.edge(treatment, outcome)
-
-for c in confounders:
-    dot.node(c, c, color='lightblue')
-    dot.edge(c, treatment)
-    dot.edge(c, outcome)
-
-st.graphviz_chart(dot)
+st.session_state.update(treatment=treatment, outcome=outcome, confounders=confounders)
 
 if treatment == outcome:
-    st.error("Treatment and outcome must be different.")
-    st.stop()
-
+    st.error("❌ Program and outcome must be different columns."); st.stop()
 if treatment in confounders or outcome in confounders:
-    st.warning("Treatment or outcome should not also be listed as confounders.")
+    st.warning("⚠️ Your program or outcome variable is also listed as a background variable — please remove it from that list.")
 
-# -----------------------------
-# Run Analysis
-# -----------------------------
-st.sidebar.header("3. Run Analysis")
+# ── 4c: Live DAG ───────────────────────────────────────────────────────────────
+st.subheader("4c — Your causal diagram")
+st.caption("This diagram shows your assumptions about how variables relate. Arrows mean 'influences'.")
+dot = Digraph()
+dot.attr("node", shape="box", style="filled", fontname="Helvetica")
+dot.attr(rankdir="LR")
+dot.node(treatment, f"Program\n({treatment})", color="lightgreen")
+dot.node(outcome,   f"Outcome\n({outcome})",   color="lightcoral")
+dot.edge(treatment, outcome, label=" effect?")
+for c in confounders:
+    dot.node(c, c, color="lightblue")
+    dot.edge(c, treatment, style="dashed")
+    dot.edge(c, outcome,   style="dashed")
+st.graphviz_chart(dot)
+st.caption("🟢 Green = program   🔴 Red = outcome   🔵 Blue = background variable   Dashed = confounding path")
 
-if st.sidebar.button("Estimate Effect"):
+# ── 4d: Data readiness ─────────────────────────────────────────────────────────
+st.subheader("4d — Data readiness check")
+issues = check_readiness(df, treatment, outcome, confounders)
+if not issues:
+    st.success("✅ Data looks ready for analysis")
+else:
+    for i in issues: st.warning(f"⚠️ {i}")
+    if _AI and st.button("🛠 How do I fix these issues?"):
+        with st.spinner():
+            fixes = _chat(f"A program director has these data issues: {issues}. "
+                          f"Suggest simple fixes in plain language. Assume they use Excel or basic Python.")
+        if fixes: st.write(fixes)
+    st.info("You can still proceed, but results may be less reliable.")
 
-    try:
-        # -----------------------------
-        # Data Diagnostics
-        # -----------------------------
-        st.subheader("🔍 Data Diagnostics")
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — Choose Analysis Method
+# ══════════════════════════════════════════════════════════════════════════════
+st.header("Step 5 — Analysis Method")
 
-        treatment_counts = df[treatment].value_counts()
+rec = recommend_approach(df)
+st.info(f"**Recommended method:** {rec['method']}  \n**Why:** {rec['reason']}")
 
-        st.write("Treatment Distribution:")
+with st.expander("📖 What does this method do?", expanded=False):
+    descriptions = {
+        "Difference-in-Differences": (
+            "**Difference-in-Differences (DiD)** compares how your outcome changed over time "
+            "in the program group vs a comparison group. It's like asking: 'Did things improve "
+            "more for program participants than for similar people who didn't participate?' "
+            f"\n\n{glossary_tip('parallel trends')}"
+        ),
+        "Backdoor (PSM / Regression)": (
+            "**Propensity Score Matching (PSM)** finds people who didn't receive the program "
+            "but were otherwise very similar to those who did, then compares outcomes. "
+            "**Linear Regression** estimates the program effect while statistically controlling "
+            "for background variables. Running both gives you a sense of how robust the result is."
+        ),
+        "Interrupted Time Series": (
+            "**Interrupted Time Series** looks at a single group's trend before and after the "
+            "program started, and tests whether the trend changed meaningfully at that point."
+        ),
+    }
+    st.markdown(descriptions.get(rec["method"], ""))
 
-        treatment_counts_df = (
-            treatment_counts
-            .rename_axis(treatment)
-            .reset_index(name="count")
-        )
+# ── DiD extra setup ────────────────────────────────────────────────────────────
+did_ready = time_col = post_col = None
+if rec["method"] == "Difference-in-Differences":
+    st.subheader("DiD column setup")
+    st.caption("Select which columns represent time and the before/after split.")
 
-        st.dataframe(treatment_counts_df)
+    with st.expander("❓ How do I know which column is which?", expanded=False):
+        st.markdown("""
+**For DiD you need four distinct columns:**
 
-        # -----------------------------
-        # Trust Indicators (NEW)
-        # -----------------------------
-        st.subheader("🧭 Data Quality Signals")
+| Column | What it means | Typical values | Example |
+|--------|--------------|----------------|---------|
+| 🟢 **Program variable** | Was this person/group in the program? | 0 or 1 | `group = 1` (enrolled) |
+| 🔴 **Outcome variable** | What you're measuring | Any number | `disruptions = 3` |
+| 🕐 **Time variable** | When was this observation recorded? | Month, quarter, year | `time = 4` (4th month) |
+| 📅 **Post indicator** | Was this observation after the program started? | 0 or 1 | `post = 1` (after launch) |
 
-        min_group = treatment_counts.min()
+**Common mistake:** Using the outcome as the post indicator, or using time as the outcome.
+The post indicator is just a flag (0/1) — it does not measure results.
+        """)
+        if _AI and st.button("🧠 Help me identify these columns in my data", key="did_help"):
+            with st.spinner("Analysing your columns…"):
+                hint = _chat(
+                    f"A program director is setting up a Difference-in-Differences analysis. "
+                    f"Their dataset has these columns: {df.columns.tolist()}. "
+                    f"Sample values: {df.head(3).to_dict()}. "
+                    f"Identify which column is likely: (1) the program/treatment indicator, "
+                    f"(2) the outcome, (3) the time variable, (4) the post-intervention indicator. "
+                    f"If any are ambiguous, say so. Use plain language, one short paragraph per column."
+                )
+            if hint: st.info(hint)
 
-        if min_group > 100:
-            st.success("🟢 Strong treatment balance — results are more reliable")
-        elif min_group > 30:
-            st.warning("🟡 Moderate imbalance — interpret results with caution")
-        else:
-            st.error("🔴 Severe imbalance — results may be unreliable")
-
-        # -----------------------------
-        # Guardrails (existing)
-        # -----------------------------
-        if treatment_counts.min() < 10:
-            st.warning("Very small group detected. Estimates may be unstable.")
-
-        if treatment_counts.nunique() < 2:
-            st.error("Treatment must have at least two groups (e.g., 0 and 1).")
+    # Guard: treatment and outcome must be confirmed before we can filter correctly
+    if not treatment or not outcome or treatment == outcome:
+        st.warning("⚠️ Please confirm your program and outcome variables in Step 4 before setting up DiD columns.")
+    else:
+        did_cols = [c for c in cols if c not in (treatment, outcome)]
+        if len(did_cols) < 2:
+            st.error("❌ Not enough columns — time and post indicator must be separate from your program and outcome columns.")
             st.stop()
 
-        
-                # -----------------------------
-        # Build model
-        # -----------------------------
-        model = CausalModel(
-            data=df,
-            treatment=treatment,
-            outcome=outcome,
-            graph=graph
-        )
+        # Clear any stale session state that points to an excluded column
+        if st.session_state.get("did_time") not in did_cols:
+            st.session_state["did_time"] = did_cols[0]
 
-        identified_estimand = model.identify_effect()
+        c1, c2 = st.columns(2)
+        with c1:
+            time_col = st.selectbox(
+                "Time variable", did_cols,
+                index=did_cols.index(st.session_state["did_time"]),
+                key="did_time",
+                help="The column representing when each observation occurred (e.g. month, quarter, year). Cannot be your program or outcome column.")
 
-        estimate = model.estimate_effect(
-            identified_estimand,
-            method_name="backdoor.propensity_score_matching"
-        )
+        post_cols = [c for c in did_cols if c != time_col]
+        if st.session_state.get("did_post") not in post_cols:
+            st.session_state["did_post"] = post_cols[0]
 
-        # -----------------------------
-        # Alternative Method: Regression (NEW)
-        # -----------------------------
-        regression_estimate = model.estimate_effect(
-            identified_estimand,
-            method_name="backdoor.linear_regression"
-        )
+        with c2:
+            post_col = st.selectbox(
+                "Post-intervention indicator (0 = before, 1 = after)",
+                post_cols,
+                index=post_cols.index(st.session_state["did_post"]),
+                key="did_post",
+                help="A 0/1 column: 0 = before the program started, 1 = after. Must differ from your program, outcome, and time columns.")
 
-        # -----------------------------
-        # Results (Multi-Method)
-        # -----------------------------
-        st.subheader("📊 Results (Multi-Method Comparison)")
-
-        psm_effect = estimate.value
-        reg_effect = regression_estimate.value
-        # Try to extract additional statistics safely
-        # -----------------------------
-# Diagnostics Table (prep)
-# -----------------------------
-        psm_se = getattr(estimate, "stderr", None)
-        reg_se = getattr(regression_estimate, "stderr", None)
-
-        diagnostics_df = pd.DataFrame({
-            "Method": ["Propensity Score Matching", "Linear Regression"],
-            "Effect": [psm_effect, reg_effect],
-            "Std Error": [psm_se, reg_se],
-            "N (approx)": [len(df), len(df)]
-        })
-
-        if reg_se is not None:
-            diagnostics_df["CI Lower"] = diagnostics_df["Effect"] - 1.96 * diagnostics_df["Std Error"]
-            diagnostics_df["CI Upper"] = diagnostics_df["Effect"] + 1.96 * diagnostics_df["Std Error"]
-
-
-        results_df = pd.DataFrame({
-            "Method": ["Propensity Score Matching", "Linear Regression"],
-            "Estimated Effect": [psm_effect, reg_effect]
-        })
-
-        st.dataframe(results_df)
-
-        st.subheader("🧠 Method Comparison")
-
-        diff = abs(psm_effect - reg_effect)
-
-        if diff < 0.05:
-            st.success("🟢 Methods are consistent — this strengthens confidence in the result.")
-
-        elif diff < 0.15:
-            st.warning("🟡 Methods differ somewhat — results may depend on modeling assumptions.")
-
+        if df[post_col].nunique() < 2:
+            st.warning("The post column must contain both 0 (before) and 1 (after) values.")
         else:
-            st.info("""
-        🔍 Methods differ substantially.
+            did_ready = True
+            st.success("✅ DiD setup looks valid")
 
-        This does not necessarily mean one is wrong. Differences can arise due to:
-        - Treatment effects varying across individuals
-        - Limited overlap between groups
-        - Model assumptions (e.g., linearity in regression)
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — Run Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+st.header("Step 6 — Run Analysis")
+st.caption("When you're happy with the setup above, click the button to estimate the program's effect.")
 
-        Consider examining subgroup effects or overlap.
-        """)
+if not st.button("▶ Estimate Program Effect", type="primary"): st.stop()
 
-        
+try:
+    # Treatment group sizes
+    tcounts = df[treatment].value_counts()
+    min_grp = int(tcounts.min())
+    st.session_state.min_group = min_grp
 
-        # -----------------------------
-        # Practical Interpretation
-        # -----------------------------
-        st.subheader("🎯 Practical Interpretation")
+    if tcounts.nunique() < 2: st.error("❌ Treatment column needs at least two groups (0 and 1)."); st.stop()
+    if df[outcome].nunique() < 2: st.error("❌ Outcome column needs at least two different values."); st.stop()
+    if min_grp < 10: st.warning("⚠️ One group has fewer than 10 people — estimates will be very uncertain.")
 
-        # Baseline rate
-        baseline = df[outcome].mean() * 100
+    use_did = rec["method"] == "Difference-in-Differences" and did_ready and time_col and post_col
+    st.session_state.use_did = use_did
 
-        # Convert effects to percentage points
-        psm_pct = psm_effect * 100
-        reg_pct = reg_effect * 100
+    progress = st.progress(0, text="Starting analysis…")
 
-        st.write(
-            f"The baseline rate of {outcome} is approximately {baseline:.1f}%."
-        )
+    # ── DiD ────────────────────────────────────────────────────────────────────
+    if use_did:
+        progress.progress(30, text="Running Difference-in-Differences model…")
+        eff, se, _ = run_did(df, treatment, outcome, time_col, post_col)
+        st.session_state.update(did_effect=eff, did_se=se)
 
-        st.write(
-            f"The estimated effect ranges from {psm_pct:.1f}% to {reg_pct:.1f}% (percentage points)."
-        )
+        progress.progress(70, text="Checking parallel trends…")
+        _, pval, fig = check_parallel_trends(df, treatment, outcome, time_col, post_col)
+        progress.progress(100, text="Done ✅"); progress.empty()
 
-        # Directional interpretation
-        if psm_effect < 0:
-            st.success(
-                f"📉 {treatment} may reduce the likelihood of {outcome} by about "
-                f"{abs(psm_pct):.1f}%."
-            )
-        else:
-            st.warning(
-                f"📈 {treatment} may increase the likelihood of {outcome} by about "
-                f"{abs(psm_pct):.1f}%."
-            )
-
-        # Intuitive framing
-        st.write(
-            f"In practical terms, this means about {abs(psm_pct):.0f} fewer disruptions "
-            f"per 100 similar cases."
-        )
-        
-
-        # -----------------------------
-        # Interpretation
-        # -----------------------------
-        st.subheader("🧾 Interpretation")
-
-        effect = estimate.value
-
-        st.write(
-            f"On average, units that received the treatment had an outcome "
-            f"{'lower' if effect < 0 else 'higher'} by approximately {abs(effect):.3f}."
-        )
-
-        st.write("""
-        ⚠️ This result depends on:
-        - Correct model specification  
-        - Inclusion of all relevant confounders  
-        - No hidden bias  
-        """)
-
-        # -----------------------------
-        # Refutation Test
-        # -----------------------------
-        st.subheader("🔍 Refutation Test")
-
-        refutation = None  # ✅ ALWAYS define first
-
-        try:
-            refutation = model.refute_estimate(
-                identified_estimand,
-                estimate,
-                method_name="placebo_treatment_refuter"
-            )
-
-            st.write(refutation)
-
-        except Exception:
-            st.warning(
-                "Refutation test could not be completed. "
-                "This can happen with small samples or random assignment issues."
-            )
-
-                # -----------------------------
-        # Confidence Summary (NEW)
-        # -----------------------------
-        st.subheader("🧭 Overall Confidence")
-
-        signals = []
-
-        # 1. Balance signal
-        if min_group > 100:
-            signals.append("good_balance")
-        elif min_group > 30:
-            signals.append("moderate_balance")
-        else:
-            signals.append("poor_balance")
-
-        # 2. Method agreement
-        diff = abs(psm_effect - reg_effect)
-        if diff < 0.05:
-            signals.append("strong_agreement")
-        elif diff < 0.15:
-            signals.append("moderate_agreement")
-        else:
-            signals.append("weak_agreement")
-
-        # 3. Refutation signal (simple heuristic)
-        if refutation is not None:
-            ref_text = str(refutation)
-            if "significant" in ref_text.lower():
-                signals.append("refutation_pass")
+        st.subheader("📈 Pre-program trend check")
+        st.caption("For DiD to be valid, both groups should have been moving similarly before the program started.")
+        st.pyplot(fig, use_container_width=False)
+        if pval is not None:
+            if pval > 0.05:
+                st.success(f"🟢 Trends look parallel before the program — DiD assumption holds (p={pval:.3f}).")
             else:
-                signals.append("refutation_unclear")
+                st.warning(f"🟡 Trends may not be parallel before the program (p={pval:.3f}). Interpret results cautiously.")
         else:
-            signals.append("refutation_failed")
+            st.info("Not enough pre-program data to check trends.")
 
+        diag_df = pd.DataFrame({"Method": ["Difference-in-Differences"],
+                                 "Estimated Effect": [eff], "Std Error": [se], "N": [len(df)]})
+        st.subheader("📊 Results")
+        st.dataframe(diag_df, use_container_width=True)
 
-        # -----------------------------
-        # Model Diagnostics (TOGGLE)
-        # -----------------------------
-        with st.expander("📊 Model Diagnostics (click to expand)", expanded=False):
+    # ── Backdoor ───────────────────────────────────────────────────────────────
+    else:
+        progress.progress(20, text="Building causal model…")
+        graph   = build_graph(treatment, outcome, confounders)
+        cm      = CausalModel(data=df, treatment=treatment, outcome=outcome, graph=graph)
+        estimand= cm.identify_effect()
 
-            st.write("Detailed model output for technical review:")
+        progress.progress(50, text="Running propensity score matching (this can take a moment)…")
+        psm_r   = cm.estimate_effect(estimand, method_name="backdoor.propensity_score_matching")
 
-            st.dataframe(diagnostics_df)
+        progress.progress(75, text="Running regression…")
+        reg_r   = cm.estimate_effect(estimand, method_name="backdoor.linear_regression")
 
-            st.caption("""
-            Notes:
-            - Standard errors may vary depending on method assumptions
-            - PSM focuses on matched samples
-            - Regression uses all available data
+        progress.progress(90, text="Running refutation test…")
+        psm_eff, reg_eff = psm_r.value, reg_r.value
+        st.session_state.update(psm_effect=psm_eff, reg_effect=reg_eff)
+
+        st.subheader("📊 Results — Two Methods for Robustness")
+        diag_df = pd.DataFrame({"Method": ["Propensity Score Matching (PSM)", "Linear Regression"],
+                                 "Estimated Effect": [psm_eff, reg_eff]})
+        st.dataframe(diag_df, use_container_width=True)
+
+        diff = abs(psm_eff - reg_eff)
+        if   diff < 0.05: st.success("🟢 Both methods agree — result is more reliable.")
+        elif diff < 0.15: st.warning("🟡 Methods differ slightly — result is suggestive but check your assumptions.")
+        else:             st.info("🔍 Methods differ substantially — this may mean the program effect varies across participants, or background variables need review.")
+
+        st.subheader("🔍 Refutation test")
+        st.caption("This test randomly scrambles the program assignment. A trustworthy model should show near-zero effect after scrambling.")
+        try:
+            refut = cm.refute_estimate(estimand, psm_r, method_name="placebo_treatment_refuter")
+            st.write(refut)
+        except Exception:
+            st.info("Refutation test could not run — this sometimes happens with small samples.")
+
+        if _AI:
+            with st.expander("🧠 AI: Plain-language explanation of these results", expanded=False):
+                with st.spinner():
+                    exp = _chat(
+                        f'A program director ran a causal analysis. '
+                        f'Question: "{st.session_state.question or "program impact on outcome"}". '
+                        f'PSM estimated effect: {psm_eff:.4f}. Regression: {reg_eff:.4f}. '
+                        f'Outcome: {outcome}. Treatment: {treatment}. '
+                        f'Explain in plain language: what do these numbers mean, do the methods agree, '
+                        f'and what should the director tell stakeholders? No jargon, no equations.'
+                    )
+                if exp: st.write(exp)
+
+        progress.progress(100, text="Done ✅"); progress.empty()
+
+    # ── Practical interpretation ───────────────────────────────────────────────
+    st.subheader("🎯 What does this mean in practice?")
+    baseline = df[outcome].mean()
+    is_binary_outcome = df[outcome].nunique() == 2
+
+    col_base, col_effect = st.columns(2)
+    with col_base:
+        if is_binary_outcome:
+            baseline_pct = baseline * 100
+            st.metric("Baseline rate (no program)", f"{baseline_pct:.1f}%",
+                      help=f"The share of people with {outcome}=1 among those who did not receive the program.")
+        else:
+            st.metric(f"Average {outcome} (no program)", f"{baseline:.2f}",
+                      help="The average outcome value before accounting for the program effect.")
+
+    if use_did:
+        e = st.session_state.did_effect or 0
+        direction = "lower" if e < 0 else "higher"
+        pct_change = (e / baseline * 100) if baseline != 0 else 0
+        per_100 = abs(e * 100) if is_binary_outcome else None
+
+        with col_effect:
+            st.metric(f"Program effect on {outcome}", f"{e:+.3f}",
+                      delta=f"{pct_change:+.1f}% vs baseline",
+                      delta_color="inverse" if e < 0 else "normal")
+
+        if is_binary_outcome:
+            st.success(
+                f"**The program {'reduced' if e < 0 else 'increased'} {outcome} by "
+                f"{abs(pct_change):.1f} percentage points** compared to the comparison group "
+                f"over the same period. That's roughly **{abs(e*100):.0f} fewer cases per 100 people** enrolled."
+            )
+        else:
+            st.success(
+                f"**The program {'reduced' if e < 0 else 'increased'} {outcome} by "
+                f"{abs(e):.3f} units** on average ({abs(pct_change):.1f}% change from baseline), "
+                f"compared to the comparison group over the same time period."
+            )
+
+        with st.expander("💬 How to explain this to a funder or board", expanded=False):
+            n_program = int((df[treatment] == 1).sum())
+            total_impact = abs(e) * n_program
+            st.markdown(f"""
+> *"Our analysis compared {outcome} trends in the program group and a similar comparison group
+> before and after the program launched. The program group showed a
+> {'reduction' if e < 0 else 'an increase'} of **{abs(e):.3f} units** in {outcome}
+> that was not seen in the comparison group. Across our {n_program} program participants,
+> this represents an estimated total change of **{total_impact:.1f} units** in {outcome}."*
+
+*Always add: "This is an observational estimate, not from a randomised trial."*
             """)
-        # -----------------------------
-        # Interpret signals
-        # -----------------------------
-        if "poor_balance" in signals or "weak_agreement" in signals:
-            st.error("🔴 Low confidence in results")
-        elif "moderate_balance" in signals or "moderate_agreement" in signals:
-            st.warning("🟡 Moderate confidence — interpret with caution")
+
+    else:
+        p, r = st.session_state.psm_effect or 0, st.session_state.reg_effect or 0
+        avg  = (p + r) / 2
+        direction = "lower" if avg < 0 else "higher"
+        pct_change = (avg / baseline * 100) if baseline != 0 else 0
+
+        with col_effect:
+            st.metric(f"Estimated program effect", f"{avg:+.3f}",
+                      delta=f"{pct_change:+.1f}% vs baseline",
+                      delta_color="inverse" if avg < 0 else "normal")
+
+        if is_binary_outcome:
+            st.success(
+                f"**The program {'reduced' if avg < 0 else 'increased'} {outcome} by approximately "
+                f"{abs(pct_change):.1f} percentage points** after accounting for background differences. "
+                f"That translates to roughly **{abs(avg*100):.0f} fewer cases per 100 similar people** enrolled."
+            )
         else:
-            st.success("🟢 High confidence in results")
+            st.success(
+                f"**The program {'reduced' if avg < 0 else 'increased'} {outcome} by approximately "
+                f"{abs(avg):.3f} units** ({abs(pct_change):.1f}% change from the baseline average of {baseline:.2f}), "
+                f"after accounting for background differences between groups."
+            )
 
-        # Optional: show details
-        # -----------------------------
-        # -----------------------------
-        # AI Explanation of Agreement (TOGGLE)
-        # -----------------------------
-        with st.expander(
-            "🧠 Interpreting Method Differences (click to expand)",
-            expanded=False  # ✅ ensures it's closed by default
-        ):
-            try:
-                explanation = explain_method_agreement(
-                    question if 'question' in locals() else "",
-                    treatment,
-                    outcome,
-                    confounders,
-                    psm_effect,
-                    reg_effect
-                )
-                st.write(explanation)
-            except Exception:
-                st.warning("Could not generate explanation.")
+        st.caption(f"PSM estimate: {p:.4f}  |  Regression estimate: {r:.4f}  |  Average used above: {avg:.4f}")
 
-        # -----------------------------
-        # Export Report (NEW)
-        # -----------------------------
-        # -----------------------------
-        # -----------------------------
-        # Export Report
-        # -----------------------------
-        st.subheader("📄 Export Report")
+        with st.expander("💬 How to explain this to a funder or board", expanded=False):
+            n_program = int((df[treatment] == 1).sum())
+            total_impact = abs(avg) * n_program
+            st.markdown(f"""
+> *"We compared {n_program} program participants to similar non-participants using two
+> statistical methods (propensity score matching and regression). Both suggest the program
+> {'reduced' if avg < 0 else 'increased'} {outcome} by approximately **{abs(avg):.3f} units**
+> ({abs(pct_change):.1f}% change). Across all participants, this represents an estimated
+> total impact of **{total_impact:.1f} units** in {outcome}."*
 
-        report = f"""
-CAUSAL ANALYSIS REPORT
-----------------------
+*Always add: "This is an observational estimate, not from a randomised trial."*
+            """)
 
-Question:
-{question if 'question' in locals() else 'Not provided'}
+    # ── Confidence summary ─────────────────────────────────────────────────────
+    st.subheader("🧭 How confident should you be?")
+    signals = []
+    mn = st.session_state.min_group
+    if mn: signals.append("good_balance" if mn > 100 else "moderate_balance" if mn > 30 else "poor_balance")
+    if not use_did:
+        d = abs((st.session_state.psm_effect or 0) - (st.session_state.reg_effect or 0))
+        signals.append("strong_agreement" if d < 0.05 else "moderate_agreement" if d < 0.15 else "weak_agreement")
 
-Treatment:
-{treatment}
+    if   "poor_balance" in signals or "weak_agreement"         in signals:
+        st.error("🔴 Lower confidence — small groups or inconsistent methods. Share results carefully and note limitations.")
+    elif "moderate_balance" in signals or "moderate_agreement" in signals:
+        st.warning("🟡 Moderate confidence — results are suggestive. Useful for internal decision-making but not definitive proof.")
+    else:
+        st.success("🟢 Higher confidence — results are consistent across methods and groups are well-balanced.")
 
-Outcome:
-{outcome}
+    st.caption("⚠️ These results come from observational data, not a randomised trial. The estimate assumes no hidden confounders.")
 
-Confounders:
-{', '.join(confounders)}
+    with st.expander("📊 Technical diagnostics", expanded=False):
+        st.dataframe(diag_df, use_container_width=True)
+        st.write(f"**Treatment group sizes:**")
+        st.dataframe(tcounts.rename_axis(treatment).reset_index(name="count"), use_container_width=True)
+        st.caption("PSM matches on propensity scores from the observed background variables. Regression controls for them linearly.")
 
---------------------------------------
-DATA DIAGNOSTICS
---------------------------------------
-{treatment_counts.to_string()}
+    # ── Export ─────────────────────────────────────────────────────────────────
+    st.subheader("📄 Export Report")
+    results_txt = (f"DiD Effect: {st.session_state.did_effect:.4f}  SE: {st.session_state.did_se:.4f}"
+                   if use_did else
+                   f"PSM: {st.session_state.psm_effect:.4f}  |  Regression: {st.session_state.reg_effect:.4f}")
+    report = (f"CAUSAL ANALYSIS REPORT\n{'='*40}\n"
+              f"Question:    {st.session_state.question or 'N/A'}\n"
+              f"Treatment:   {treatment}\nOutcome:     {outcome}\n"
+              f"Confounders: {', '.join(confounders) or 'None'}\n\n"
+              f"TREATMENT GROUP SIZES\n{tcounts.to_string()}\n\n"
+              f"RESULTS\n{results_txt}\n\n"
+              f"LIMITATIONS\n"
+              f"- Observational data, not a randomised trial\n"
+              f"- Assumes no important unmeasured confounders\n"
+              f"- Results depend on model assumptions and variable selection\n"
+              f"- Use as one input to decision-making, not definitive proof\n")
+    st.download_button("⬇️ Download Report", report, "causal_analysis_report.txt", "text/plain")
+    st.session_state.analysis_ran = True
 
---------------------------------------
-RESULTS
---------------------------------------
-Estimated Treatment Effect (ATE):
-{estimate.value:.4f}
-
---------------------------------------
-INTERPRETATION
---------------------------------------
-On average, the treatment {'reduced' if estimate.value < 0 else 'increased'} the outcome.
-
---------------------------------------
-LIMITATIONS
---------------------------------------
-- Observational data (not randomized)
-- Assumes no unmeasured confounders
-- Results depend on model specification
-"""
-
-        st.download_button(
-            label="⬇️ Download Report",
-            data=report,
-            file_name="causal_analysis_report.txt",
-            mime="text/plain"
-        )
-
-    except Exception as e:
-        st.error(f"Error: {e}")
+except Exception as exc:
+    st.error("Something went wrong during the analysis. See details below.")
+    with st.expander("🔧 Technical error details (for your data team)"):
+        st.exception(exc)

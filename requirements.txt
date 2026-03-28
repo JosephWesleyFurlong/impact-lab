@@ -5,6 +5,7 @@ numpy<2.0
 dowhy
 scikit-learn
 openai
+statsmodels==0.14.2
 
 # Graph stack (pin versions)
 graphviz==0.20
