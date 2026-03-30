@@ -47,13 +47,46 @@ def _chat(prompt, system="You are a causal inference expert helping program dire
 # ── Data generators ────────────────────────────────────────────────────────────
 @st.cache_data
 def generate_backdoor_data(n=1000, seed=42):
+    """
+    Realistic cross-sectional PSM dataset: youth mentoring program.
+    Design goals:
+    - ~50/50 treatment split for good PSM overlap
+    - Propensity scores spanning 0.15-0.85 (real common support)
+    - Confounders with moderate SMDs (0.15-0.35) — correctable by PSM
+    - True ATT = -0.9 disruption units (mentoring reduces disruptions)
+    - Binary outcome (disruption: 0/1) for interpretability
+    """
     rng = np.random.default_rng(seed)
-    trauma = rng.normal(50, 10, n)
-    prior  = rng.poisson(2, n)
-    ment   = rng.binomial(1, 1/(1+np.exp(-(0.05*trauma+0.3*prior))))
-    disrupt= rng.binomial(1, 1/(1+np.exp(-(0.04*trauma+0.5*prior-0.8*ment))))
-    return pd.DataFrame({"age": rng.integers(5,18,n), "trauma_score": trauma,
-                         "prior_placements": prior, "mentoring": ment, "disruption": disrupt})
+
+    # Background variables (confounders)
+    age              = rng.integers(8, 18, n).astype(float)
+    trauma_score     = rng.normal(50, 15, n).clip(0, 100)
+    prior_placements = rng.poisson(2, n).clip(0, 8).astype(float)
+    case_complexity  = rng.binomial(1, 0.4, n).astype(float)  # 1=complex
+
+    # Standardise for logit — keeps coefficients interpretable
+    trauma_z = (trauma_score - 50) / 15
+    prior_z  = (prior_placements - 2) / 1.5
+    age_z    = (age - 13) / 3
+
+    # Program assignment: higher trauma/prior placements → more likely referred
+    # Intercept=0 gives ~50% baseline enrollment; range ~0.2-0.8
+    logit    = 0.35*trauma_z + 0.30*prior_z + 0.15*case_complexity - 0.10*age_z
+    mentoring= rng.binomial(1, 1/(1+np.exp(-logit)))
+
+    # Outcome: disruption (binary). True causal effect = -0.9 units (mentoring helps)
+    noise           = rng.normal(0, 0.8, n)
+    disruption_cont = 1.5 + 0.6*trauma_z + 0.5*prior_z + 0.3*case_complexity - 0.9*mentoring + noise
+    disruption      = (disruption_cont > disruption_cont.mean()).astype(int)
+
+    return pd.DataFrame({
+        "age":              age.astype(int),
+        "trauma_score":     trauma_score.round(1),
+        "prior_placements": prior_placements.astype(int),
+        "case_complexity":  case_complexity.astype(int),
+        "mentoring":        mentoring,
+        "disruption":       disruption,
+    })
 
 @st.cache_data
 def generate_did_data(n=1000, seed=42):
@@ -96,7 +129,7 @@ def generate_did_data(n=1000, seed=42):
 def suggest_variables(df):
     cols = df.columns.tolist()
     treatment_keywords = ["treat","program","enroll","intervention","mentoring","assigned","group","cohort","participant"]
-    outcome_keywords   = ["outcome","result","disruption","success","score","rate","count","incident","event","measure"]
+    outcome_keywords   = ["outcome","result","disruption","success","rate","count","incident","event","measure","index"]
     # Exclude obvious non-variable columns from candidacy
     exclude_keywords   = ["id","time","date","year","quarter","month","week","period","post","before","after","wave"]
     candidates = [c for c in cols if not any(x in c.lower() for x in exclude_keywords)]
@@ -249,7 +282,12 @@ def check_parallel_trends(df, treatment, outcome, time_col, post_col):
 def compute_psm_balance(df, treatment, confounders):
     """
     Standardised Mean Differences (SMD) for each confounder before matching.
-    SMD < 0.1 = good balance; 0.1-0.2 = moderate; > 0.2 = poor.
+    Thresholds (following Austin 2011 and applied program evaluation norms):
+      SMD < 0.1  = Good
+      0.1–0.25   = Moderate (worth noting but often acceptable)
+      > 0.25     = Poor (may meaningfully bias estimates)
+    Raw mean difference is shown alongside SMD — a small SMD on a trivially
+    different raw scale (e.g. 0.6 years of age) should not be flagged as "poor."
     """
     rows = []
     treated = df[df[treatment] == 1]
@@ -260,10 +298,16 @@ def compute_psm_balance(df, treatment, confounders):
             st_, sc  = treated[c].std(),  control[c].std()
             pooled   = np.sqrt((st_**2 + sc**2) / 2)
             smd      = (mt - mc) / pooled if pooled > 0 else 0
-            balance  = "✅ Good" if abs(smd) < 0.1 else "🟡 Moderate" if abs(smd) < 0.2 else "🔴 Poor"
-            rows.append({"Variable": c, "Mean (Program)": round(mt, 3),
-                         "Mean (Comparison)": round(mc, 3),
-                         "SMD": round(abs(smd), 3), "Balance": balance})
+            raw_diff = mt - mc
+            balance  = "✅ Good" if abs(smd) < 0.1 else "🟡 Moderate" if abs(smd) < 0.25 else "🔴 Poor"
+            rows.append({
+                "Variable":          c,
+                "Mean (Program)":    round(mt, 3),
+                "Mean (Comparison)": round(mc, 3),
+                "Raw difference":    round(raw_diff, 3),
+                "SMD":               round(abs(smd), 3),
+                "Balance":           balance,
+            })
         except Exception:
             pass
     return pd.DataFrame(rows)
@@ -303,27 +347,35 @@ def plot_propensity_overlap(df, treatment, confounders):
 
 def compute_evalue(effect, se):
     """
-    E-value (VanderWeele & Ding 2017): the minimum association strength
-    an unmeasured confounder would need with BOTH treatment and outcome
-    to fully explain away the observed effect.
-    Larger E-value = result is more robust to hidden confounding.
-    Uses the continuous-outcome approximation via the standardised effect (effect/se).
+    E-value (VanderWeele & Ding 2017): minimum unmeasured confounding strength
+    needed to fully explain away the observed effect.
+    Uses the continuous-outcome approximation: convert standardised effect (d = effect/se)
+    to an approximate risk ratio, then apply the E-value formula.
+    RR_approx = exp(0.477 * |d|)  — matches VanderWeele 2017 Table 2 for d in [0,2].
+    E-value = RR + sqrt(RR*(RR-1)).  Range: 1 (no robustness) to ~5 (very robust).
+    Returns (evalue_point, evalue_ci) or (None, None) if not computable.
     """
     if se is None or se == 0 or effect is None: return None, None
-    # Standardised effect size
-    d = abs(effect / se)
-    # Convert to approximate RR using VanderWeele approximation for continuous outcomes
-    # RR ≈ exp(0.91 * d) for standardised effects (conservative approximation)
-    rr = np.exp(0.91 * abs(effect) / (se * np.sqrt(2)))
+    d = abs(effect / se)          # standardised effect size (like Cohen's d)
+    if d < 0.001: return None, None   # indistinguishable from zero
+
+    # Approximate RR on the confounder-association scale
+    # Capped at d=3 to avoid astronomical values from poorly estimated SEs
+    d_capped = min(d, 3.0)
+    rr = np.exp(0.477 * d_capped)
     if rr <= 1: return None, None
+
     evalue = rr + np.sqrt(rr * (rr - 1))
-    # E-value for CI bound (effect - 1.96*se)
-    effect_ci = abs(effect) - 1.96 * se
-    if effect_ci <= 0:
-        evalue_ci = 1.0  # CI crosses null — E-value for CI is 1
+
+    # CI bound E-value: use effect - 1.96*se
+    d_ci = max(abs(effect) - 1.96 * se, 0) / se if se > 0 else 0
+    if d_ci < 0.001:
+        evalue_ci = 1.0   # CI includes null — result not significant, E-value for CI = 1
     else:
-        rr_ci     = np.exp(0.91 * effect_ci / (se * np.sqrt(2)))
+        d_ci_capped = min(d_ci, 3.0)
+        rr_ci = np.exp(0.477 * d_ci_capped)
         evalue_ci = rr_ci + np.sqrt(max(rr_ci * (rr_ci - 1), 0)) if rr_ci > 1 else 1.0
+
     return round(evalue, 2), round(evalue_ci, 2)
 
 # ── Glossary tooltip helper ────────────────────────────────────────────────────
@@ -832,7 +884,7 @@ try:
     imbalance_ratio = min_grp / max_grp if max_grp > 0 else 0
     st.session_state.min_group = min_grp
 
-    if tcounts.nunique() < 2:
+    if df[treatment].nunique() < 2:
         st.error("❌ Treatment column needs at least two groups (0 and 1)."); st.stop()
     if df[outcome].nunique() < 2:
         st.error("❌ Outcome column needs at least two different values."); st.stop()
@@ -978,11 +1030,14 @@ If the program group scores are all near 1.0 and the comparison group near 0.0, 
                 st.dataframe(bal_df, use_container_width=True, hide_index=True)
                 poor_balance = bal_df[bal_df["SMD"] > 0.2]
                 if poor_balance.empty:
-                    st.success("🟢 All confounders show reasonable pre-matching balance (SMD < 0.2).")
+                    st.success("🟢 All confounders show reasonable pre-matching balance (SMD < 0.25). "
+                               "Check the raw differences above to confirm they are practically small.")
                 else:
-                    st.warning(f"🟡 {len(poor_balance)} variable(s) show poor balance (SMD > 0.2): "
+                    st.warning(f"🟡 {len(poor_balance)} variable(s) show SMD > 0.25: "
                                f"{', '.join(poor_balance['Variable'].tolist())}. "
-                               f"PSM will attempt to correct this, but large imbalances are harder to fix.")
+                               f"Check whether the **raw mean difference** is practically meaningful — "
+                               f"a large SMD on a variable with low variance may not matter clinically. "
+                               f"PSM will attempt to correct imbalance, but large differences are harder to fix.")
         else:
             st.warning("No confounders selected — balance cannot be assessed.")
 
@@ -1002,40 +1057,72 @@ If the program group scores are all near 1.0 and the comparison group near 0.0, 
         st.session_state.update(psm_effect=psm_eff, reg_effect=reg_eff)
 
         # ── Results ────────────────────────────────────────────────────────────
-        st.subheader("📊 Results — PSM (ATT) and Regression (ATE)")
+        st.subheader("📊 Results — PSM and Regression")
         st.caption(
-            "These two methods answer **related but different questions**. "
-            "PSM estimates the effect **for people who actually enrolled** (ATT — Average Treatment effect on the Treated). "
-            "Regression estimates the average effect **across everyone** in the sample (ATE — Average Treatment Effect). "
+            "These two methods answer related but subtly different questions depending on implementation. "
+            "**PSM here uses nearest-neighbour matching anchored to the treated group**, which estimates the ATT "
+            "(Average Treatment effect on the Treated — the effect for people who actually enrolled). "
+            "PSM can also estimate the ATE by matching in both directions, but that is not the default used here. "
+            "**OLS regression with controls** estimates a variance-weighted average of individual effects — "
+            "close to the ATE under linearity and homogeneity, but not identical. "
             "Both are reported separately — do not average them."
         )
 
         col_psm, col_reg = st.columns(2)
         with col_psm:
             st.markdown("### Propensity Score Matching")
-            st.markdown("**Estimand: ATT** — effect on those who enrolled")
+            st.markdown("**Estimates: ATT** (as implemented here — nearest-neighbour, treated-anchored)")
             st.metric("Estimated Effect", f"{psm_eff:+.4f}")
-            st.caption("PSM finds matched non-participants for each participant and compares outcomes directly.")
+            st.caption("Each enrolled participant is matched to a similar non-participant. "
+                       "The effect is estimated for the enrolled group. PSM *can* estimate ATE "
+                       "by matching in both directions, but this app uses the ATT formulation.")
         with col_reg:
-            st.markdown("### Linear Regression")
-            st.markdown("**Estimand: ATE** — effect across all eligible people")
+            st.markdown("### Linear Regression with Controls")
+            st.markdown("**Estimates: weighted average ≈ ATE** (under linearity and homogeneity)")
             st.metric("Estimated Effect", f"{reg_eff:+.4f}")
-            st.caption("Regression controls for confounders linearly and estimates the population-average effect.")
+            st.caption("Controls for confounders linearly across the full sample. Approximates the ATE "
+                       "but puts more weight on units near the centre of the covariate distribution. "
+                       "Strictly an ATE only if the treatment effect is constant across all participants.")
 
-        # Agreement note — now correctly framed
+        # Agreement note
         diff = abs(psm_eff - reg_eff)
         st.markdown("---")
-        st.markdown("**ATT vs ATE difference:**")
+        st.markdown("**Do the two estimates agree?**")
         if diff < 0.1:
-            st.success(f"🟢 ATT and ATE are close ({diff:.4f} apart) — treatment effects appear fairly uniform across the population.")
+            st.success(f"🟢 The two estimates are close ({diff:.4f} apart). This is reassuring — it suggests "
+                       f"the program effect is fairly consistent across participants, and that the ATT "
+                       f"(effect on enrolled youth) is similar to the broader population-average effect.")
         else:
-            st.info(f"🔵 ATT and ATE differ by {diff:.4f} — this suggests the program effect varies across participants. "
-                    f"People who enrolled may have benefited {'more' if psm_eff < reg_eff else 'less'} than the average eligible person would have.")
+            st.info(f"🔵 The estimates differ by {diff:.4f}. This can arise for several reasons: "
+                    f"(1) the program effect genuinely varies — people who enrolled may have benefited "
+                    f"{'more' if psm_eff < reg_eff else 'less'} than the average eligible person would have; "
+                    f"(2) the linearity assumption in regression may not hold; or "
+                    f"(3) PSM matching quality may be imperfect. Neither estimate is necessarily wrong — "
+                    f"they answer slightly different questions.")
+
+        # Compute OLS SE and CI for regression (dowhy returns point estimate only for PSM)
+        reg_se  = None; reg_ci_lo = None; reg_ci_hi = None; reg_pval = None
+        try:
+            # Re-run OLS directly to get full inference
+            import statsmodels.formula.api as _smf
+            _confstr = " + ".join(confounders) if confounders else "1"
+            _ols = _smf.ols(f"{outcome} ~ {treatment} + {_confstr}", data=df).fit(cov_type="HC3")
+            reg_se    = round(_ols.bse.get(treatment, float("nan")), 4)
+            _ci       = _ols.conf_int().loc[treatment] if treatment in _ols.conf_int().index else (float("nan"), float("nan"))
+            reg_ci_lo = round(_ci[0], 4)
+            reg_ci_hi = round(_ci[1], 4)
+            reg_pval  = round(_ols.pvalues.get(treatment, float("nan")), 4)
+        except Exception:
+            pass
 
         diag_df = pd.DataFrame({
-            "Method": ["PSM (ATT)", "Regression (ATE)"],
-            "Estimand": ["Avg effect on enrolled", "Avg effect across all"],
-            "Estimated Effect": [round(psm_eff, 4), round(reg_eff, 4)]})
+            "Method":           ["PSM (nearest-neighbour)", "OLS Regression with controls"],
+            "Estimand":         ["ATT — avg effect on enrolled", "Weighted avg ≈ ATE"],
+            "Effect":           [round(psm_eff, 4), round(reg_eff, 4)],
+            "SE":               ["— (no analytical SE for PSM)", str(reg_se) if reg_se is not None else "—"],
+            "95% CI":           ["— ", f"[{reg_ci_lo}, {reg_ci_hi}]" if reg_ci_lo is not None else "—"],
+            "p-value":          ["— ", str(reg_pval) if reg_pval is not None else "—"],
+        })
 
         # ── Refutation ─────────────────────────────────────────────────────────
         st.subheader("🔍 Refutation Test (Placebo Treatment)")
@@ -1057,7 +1144,11 @@ If the program group scores are all near 1.0 and the comparison group near 0.0, 
             "to fully explain away this result?* Higher = more robust to hidden confounding."
         )
         # Use PSM SE approximation from effect / sqrt(n)
-        psm_se_approx = abs(psm_eff) / max(np.sqrt(min_grp), 1)
+        # SE approximation for PSM: use outcome SD / sqrt(n_treated) as conservative estimate
+        # This is the standard error of a difference in means, which PSM approximates
+        n_treated   = int((df[treatment] == 1).sum())
+        outcome_sd  = df[outcome].std()
+        psm_se_approx = outcome_sd / np.sqrt(max(n_treated, 1)) * np.sqrt(2)  # two-sample
         ev, ev_ci = compute_evalue(psm_eff, psm_se_approx)
         if ev:
             col_ev1, col_ev2 = st.columns(2)
@@ -1078,7 +1169,7 @@ If the program group scores are all near 1.0 and the comparison group near 0.0, 
                     exp = _chat(
                         f'''A program director ran a causal analysis.
 Question: "{st.session_state.question or "program impact on outcome"}".
-PSM (ATT) effect: {psm_eff:.4f}. Regression (ATE) effect: {reg_eff:.4f}.
+PSM effect (nearest-neighbour, ATT): {psm_eff:.4f}. Regression effect (weighted avg approx ATE): {reg_eff:.4f}.
 Outcome: {outcome}. Treatment: {treatment}.
 Explain: (1) what ATT vs ATE means in plain language for this program,
 (2) what the numbers mean, (3) whether they tell a consistent story,
@@ -1102,17 +1193,25 @@ Explain: (1) what ATT vs ATE means in plain language for this program,
         val   = f"{baseline*100:.1f}%" if is_binary else f"{baseline:.2f}"
         st.metric(label, val, help="Observed average in the full sample before accounting for program effects.")
     with col_eff:
-        pct_chg = (effect_for_interp / baseline * 100) if baseline != 0 else 0
+        # For binary outcomes, effect IS the percentage point change directly.
+        # For continuous, express as % of baseline mean.
+        if is_binary:
+            pp_change = effect_for_interp * 100   # e.g. -0.268 → -26.8 pp
+            delta_label = f"{pp_change:+.1f} percentage points"
+        else:
+            pct_chg   = (effect_for_interp / baseline * 100) if baseline != 0 else 0
+            delta_label = f"{pct_chg:+.1f}% change from baseline"
+
         st.metric("Estimated program effect",
                   f"{effect_for_interp:+.3f}",
-                  delta=f"{pct_chg:+.1f}% change from baseline",
+                  delta=delta_label,
                   delta_color="inverse" if effect_for_interp < 0 else "normal")
 
     direction = "reduced" if effect_for_interp < 0 else "increased"
     if is_binary:
         st.success(
-            f"**The program {direction} {outcome} by {abs(pct_chg):.1f} percentage points** "
-            f"— roughly {abs(effect_for_interp*100):.0f} fewer cases per 100 {'enrolled participants' if use_did else 'similar people'}."
+            f"**The program {direction} {outcome} by {abs(pp_change):.1f} percentage points** "
+            f"— roughly {abs(pp_change):.0f} fewer cases per 100 {'enrolled participants' if use_did else 'similar people'}."
         )
     else:
         st.success(
@@ -1131,8 +1230,9 @@ Explain: (1) what ATT vs ATE means in plain language for this program,
         st.markdown(f"""
 > *"We used observational causal analysis to estimate the impact of {treatment} on {outcome}.
 > {'The Difference-in-Differences method compared trends before and after the program in the enrolled group vs a comparison group.' if use_did else 'Propensity score matching compared enrolled participants to similar non-participants.'}
-> The analysis suggests the program **{direction} {outcome} by {abs(effect_for_interp):.3f} units**
-> ({abs(pct_chg):.1f}% change), for the {n_enrolled} enrolled participants."*
+> The analysis suggests the program **{direction} {outcome} by {'%.1f percentage points' % abs(pp_change) if is_binary else '%.3f units' % abs(effect_for_interp)}**
+> {'(%.1f pp change from a baseline rate of %.1f%%)' % (abs(pp_change), baseline*100) if is_binary else '(%.1f%% change from baseline)' % abs(pct_chg if not is_binary else 0)},
+> for the {n_enrolled} enrolled participants."*
 
 **Important caveats to always include:**
 - This is an observational estimate, not a randomised trial
@@ -1162,7 +1262,7 @@ Explain: (1) what ATT vs ATE means in plain language for this program,
             if not bal_df2.empty:
                 max_smd = bal_df2["SMD"].max()
                 signals.append("good_balance_psm" if max_smd < 0.1
-                                else "moderate_balance_psm" if max_smd < 0.2
+                                else "moderate_balance_psm" if max_smd < 0.25
                                 else "poor_balance_psm")
 
     low_conf    = "poor_balance" in signals or "not_significant" in signals or "poor_balance_psm" in signals
@@ -1183,16 +1283,35 @@ Explain: (1) what ATT vs ATE means in plain language for this program,
 
     # ── Technical diagnostics ──────────────────────────────────────────────────
     with st.expander("📊 Full technical diagnostics", expanded=False):
+        st.markdown("**Effect estimates with uncertainty:**")
         st.dataframe(diag_df, use_container_width=True, hide_index=True)
+        if not use_did:
+            st.caption("PSM does not produce an analytical standard error via this implementation — "
+                       "bootstrap SEs would require re-running the full matching procedure many times. "
+                       "The regression SE and CI are from OLS with HC3 heteroskedasticity-robust standard errors.")
+
         st.markdown("**Treatment group sizes:**")
         st.dataframe(tcounts.rename_axis(treatment).reset_index(name="count"),
                      use_container_width=True, hide_index=True)
         st.markdown(f"**Group balance ratio:** {imbalance_ratio:.2f} "
                     f"(1.0 = perfectly balanced; < 0.1 = severely imbalanced)")
+
+        if not use_did and confounders:
+            st.markdown("**Pre-matching covariate balance (SMD):**")
+            bal_diag = compute_psm_balance(df, treatment, confounders)
+            if not bal_diag.empty:
+                st.dataframe(bal_diag, use_container_width=True, hide_index=True)
+                st.caption("SMD thresholds: < 0.10 = Good, 0.10–0.25 = Moderate, > 0.25 = Poor. "
+                           "Always check the raw mean difference — a moderate SMD on a variable with "
+                           "low variance (e.g. 0.6 years of age) may be practically trivial.")
+
         if use_did:
-            st.caption(f"DiD model used {'two-way fixed effects with clustered SEs' if _detect_subject_col(df, treatment, outcome, time_col, post_col) else 'HC3 robust SEs'}.")
+            subject_col_diag = _detect_subject_col(df, treatment, outcome, time_col, post_col)
+            st.caption(f"DiD model: {'two-way fixed effects (subject + time FEs) with clustered SEs by subject' if subject_col_diag else 'HC3 heteroskedasticity-robust SEs (no subject ID column detected)'}.")
         else:
-            st.caption("PSM: ATT estimand (matched sample). Regression: ATE estimand (full sample with linear control).")
+            st.caption("PSM: nearest-neighbour matching anchored to treated units (ATT). "
+                       "Regression: OLS with linear confounder control, HC3 robust SEs (weighted avg ≈ ATE). "
+                       "PSM can estimate ATE via bidirectional matching — not implemented here.")
 
     # ── Export ─────────────────────────────────────────────────────────────────
     st.subheader("📄 Export Report")
@@ -1204,9 +1323,9 @@ Explain: (1) what ATT vs ATE means in plain language for this program,
                        f"Pre-periods: {n_pre}  |  Parallel trends p: {trend_pval if trend_pval else 'N/A'}\n"
                        f"E-value: {ev if ev else 'N/A'}")
     else:
-        results_txt = (f"PSM (ATT): {psm_eff:.4f}\n"
-                       f"Regression (ATE): {reg_eff:.4f}\n"
-                       f"ATT-ATE difference: {diff:.4f}\n"
+        results_txt = (f"PSM (nearest-neighbour, ATT): {psm_eff:.4f}\n"
+                       f"Regression with controls (weighted avg ≈ ATE): {reg_eff:.4f}\n"
+                       f"Difference between estimates: {diff:.4f}\n"
                        f"E-value (PSM): {ev if ev else 'N/A'}")
 
     report = (f"CAUSAL ANALYSIS REPORT\n{'='*40}\n"
@@ -1224,7 +1343,7 @@ Explain: (1) what ATT vs ATE means in plain language for this program,
               f"- Observational data, not a randomised trial\n"
               f"- Assumes no important unmeasured confounders\n"
               f"- Results depend on model assumptions and variable selection\n"
-              f"- PSM estimates ATT; regression estimates ATE — these answer different questions\n"
+              f"- PSM (nearest-neighbour) estimates ATT; regression approximates ATE under linearity\n""- These answer related but subtly different questions — do not average them\n"
               f"- Use as one input to decision-making, not definitive proof\n")
     st.download_button("⬇️ Download Report", report, "causal_analysis_report.txt", "text/plain")
     st.session_state.analysis_ran = True
